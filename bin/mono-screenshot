@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # mono-screenshot: панель снимка экрана как в GNOME Shell (Super+Shift+S, Ctrl+Shift+S, Print).
 # Рисует панель снизу и рамку выделения (только затемнение и белая рамка, без картинки экрана).
-# Замороженный кадр даёт hyprpicker, снимок grim, видео wf-recorder.
+# Замороженный кадр: снимок монитора через grim до показа панели, он же фон панели;
+# итоговый снимок вырезается из этого кадра. Видео wf-recorder.
+# hyprpicker не используется: версия 0.4.5 неверно выделяет буфер, и Hyprland падает вместе с ним.
 #   режимы: Выделение / Экран / Окно; переключатель Фото / Видео; показывать курсор.
 #   Выделение: тянешь рамку (можно перетянуть заново). Экран: монитор под курсором. Окно: клик по окну.
 #   Enter или Пробел снимает, Esc закрывает. Во время записи то же сочетание её останавливает.
@@ -37,8 +39,9 @@ import gi  # noqa: E402
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Graphene", "1.0")
-from gi.repository import Gdk, Gio, GLib, Graphene, Gtk  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Graphene, Gtk  # noqa: E402
 from gi.repository import Gtk4LayerShell as LS  # noqa: E402
 
 HOME = os.path.expanduser("~")
@@ -127,18 +130,17 @@ def stamp():
     return time.strftime("%Y-%m-%d %H-%M-%S")
 
 
-def can_freeze():
-    """hyprpicker замораживает все мониторы сразу. Если какой-то монитор спит (dpms off),
-    hyprpicker 0.4.5 получает от него буфер не того размера и падает с SIGBUS, а вместе
-    с ним Hyprland и вся сессия. Поэтому замораживаем только когда все мониторы включены."""
-    mons = hypr("monitors")
-    return bool(mons) and all(m.get("dpmsStatus", True) and not m.get("disabled") for m in mons)
+FROZEN = os.path.join(RUN, "mono-screenshot-frozen.ppm")
 
 
-def start_freeze():
-    if not can_freeze():
-        return None
-    return popen(["hyprpicker", "-r", "-z"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def grab_monitor(name, pointer):
+    """кадр монитора в FROZEN; True, если получилось"""
+    cmd = ["grim", "-t", "ppm"] + (["-c"] if pointer else []) + ["-o", name, FROZEN]
+    try:
+        return subprocess.run(cmd, env=CLEAN_ENV, timeout=5,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def recording_pid():
@@ -268,7 +270,7 @@ class Panel(Gtk.ApplicationWindow):
         LS.set_keyboard_mode(self, LS.KeyboardMode.EXCLUSIVE)
         self.set_hide_on_close(True)
         self.mode, self.video, self.pointer = "area", False, False
-        self.freeze = None   # hyprpicker: замороженный кадр
+        self.frozen = None   # замороженный кадр монитора (GdkPixbuf)
         self.active = False
         self.mon = None
         self.sel = Selector(self)
@@ -285,7 +287,12 @@ class Panel(Gtk.ApplicationWindow):
         box.set_margin_bottom(36)
         self.box = box
         over = Gtk.Overlay()
-        over.set_child(self.sel.shade)
+        self.bg = Gtk.Picture()  # замороженный кадр под затемнением
+        self.bg.set_content_fit(Gtk.ContentFit.FILL)
+        self.bg.set_can_shrink(True)
+        self.bg.set_can_target(False)
+        over.set_child(self.bg)
+        over.add_overlay(self.sel.shade)
         over.add_overlay(box)
         self.set_child(over)
 
@@ -384,9 +391,10 @@ class Panel(Gtk.ApplicationWindow):
         self.video = v
         if v:  # видео пишется живым, без замороженного кадра
             self.unfreeze()
-        elif self.active and not self.freeze:
-            self.freeze = start_freeze()
-            self.restack()
+        elif self.active and not self.frozen:
+            # новый кадр без панели на нём: спрятать, снять, показать
+            self.set_visible(False)
+            GLib.timeout_add(150, lambda: (self.freeze_now(), self.active and self.present(), False)[2])
         self.sync()
 
     def set_pointer(self, p):
@@ -403,49 +411,31 @@ class Panel(Gtk.ApplicationWindow):
             self.close_all()
             return True
         self.active = True
-        if not self.video:
-            self.freeze = start_freeze()
         self.mon = next((m for m in (hypr("monitors") or []) if m.get("focused")), None)
         if self.mon:
             gm = next((m for m in iter_monitors() if m.get_connector() == self.mon["name"]), None)
             if gm:
                 LS.set_monitor(self, gm)
+        if not self.video:
+            self.freeze_now()  # панель ещё не показана, на кадр она не попадёт
         self.sel.reset(self.mon, self.mode)
         self.dragging(False)
-        self.restack()
+        self.present()
         return True
 
-    def restack(self):
-        """порядок слоёв: замороженный кадр, потом панель. Позже показанный слой выше,
-        поэтому ждём, пока hyprpicker реально появится на всех мониторах: иначе он ляжет
-        сверху, заберёт клик (выберет цвет и выйдет) и Esc."""
-        self.set_visible(False)
-        freeze = self.freeze
-        n_mons = len(hypr("monitors") or [1])
-
-        def wait():
-            for _ in range(60):  # до 3 с
-                if not freeze or freeze.poll() is not None:
-                    break
-                layers = subprocess.run(["hyprctl", "layers"], capture_output=True, text=True,
-                                        env=CLEAN_ENV).stdout
-                if layers.count("namespace: hyprpicker") >= n_mons:
-                    time.sleep(0.05)  # дать ему отрисовать кадр
-                    break
-                time.sleep(0.05)
-            GLib.idle_add(show)
-
-        def show():
-            if self.active:
-                self.present()
-            return False
-        threading.Thread(target=wait, daemon=True).start()
+    def freeze_now(self):
+        self.unfreeze()
+        if not self.mon or not grab_monitor(self.mon["name"], self.pointer):
+            return  # не вышло: снимем вживую
+        try:
+            self.frozen = GdkPixbuf.Pixbuf.new_from_file(FROZEN)
+            self.bg.set_paintable(Gdk.Texture.new_from_filename(FROZEN))
+        except GLib.Error:
+            self.frozen = None
 
     def unfreeze(self):
-        if self.freeze and self.freeze.poll() is None:
-            self.freeze.kill()  # на TERM hyprpicker иногда не реагирует
-            threading.Thread(target=self.freeze.wait, daemon=True).start()
-        self.freeze = None
+        self.frozen = None
+        self.bg.set_paintable(None)
 
     def close_all(self):
         self.active = False
@@ -476,10 +466,29 @@ class Panel(Gtk.ApplicationWindow):
     def photo(self, target):
         os.makedirs(SHOTS, exist_ok=True)
         f = os.path.join(SHOTS, f"Снимок экрана от {stamp()}.png")
-        cmd = ["grim", "-l", "1"] + (["-c"] if self.pointer else []) + target + [f]
+        frozen, mon = self.frozen, self.mon
 
         def work():
-            ok = subprocess.run(cmd, env=CLEAN_ENV).returncode == 0
+            ok = False
+            if frozen is not None:  # вырезать из замороженного кадра
+                try:
+                    if target[:1] == ["-g"]:
+                        xy, wh = target[1].split(" ")
+                        x, y = (int(v) - o for v, o in zip(xy.split(","), (mon["x"], mon["y"])))
+                        w, h = (int(v) for v in wh.split("x"))
+                        x, y = max(0, x), max(0, y)
+                        w, h = min(w, frozen.get_width() - x), min(h, frozen.get_height() - y)
+                        img = frozen.new_subpixbuf(x, y, w, h) if w > 0 and h > 0 else None
+                    else:
+                        img = frozen
+                    if img is not None:
+                        img.savev(f, "png", [], [])
+                        ok = True
+                except (GLib.Error, ValueError, KeyError):
+                    ok = False
+            if not ok:  # кадра нет: снять вживую
+                cmd = ["grim", "-l", "1"] + (["-c"] if self.pointer else []) + target + [f]
+                ok = subprocess.run(cmd, env=CLEAN_ENV).returncode == 0
             GLib.idle_add(lambda: (self.unfreeze(), False)[1])
             if ok:
                 with open(f, "rb") as fh:
