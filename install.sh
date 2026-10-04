@@ -23,7 +23,7 @@ if [ "$deps" = 1 ]; then
   say "пакеты (нужен sudo)"
   sudo dnf -y copr enable solopasha/hyprland
   sudo dnf -y copr enable scottames/ghostty
-  sudo dnf -y install hyprland hyprpaper hyprpicker xdg-desktop-portal-hyprland xdg-desktop-portal-gnome \
+  sudo dnf -y install hyprland hyprpaper xdg-desktop-portal-hyprland xdg-desktop-portal-gnome \
     ghostty fastfetch nautilus gnome-control-center \
     gtk4-layer-shell python3-gobject python3-pam python3-pillow \
     swaync wlogout wofi swayidle swaylock grim slurp wf-recorder wl-clipboard \
