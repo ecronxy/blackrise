@@ -133,14 +133,33 @@ def stamp():
 FROZEN = os.path.join(RUN, "mono-screenshot-frozen.ppm")
 
 
+LOG = os.path.expanduser("~/.cache/mono-screenshot.log")
+
+
+def log(*parts):
+    """короткий журнал: открытие, кадр, выделение, снимок (для разбора без нажатий)"""
+    try:
+        with open(LOG, "a") as fh:
+            fh.write(time.strftime("%H:%M:%S ") + " ".join(str(p) for p in parts) + "\n")
+    except OSError:
+        pass
+
+
 def grab_monitor(name, pointer):
     """кадр монитора в FROZEN; True, если получилось"""
-    cmd = ["grim", "-t", "ppm"] + (["-c"] if pointer else []) + ["-o", name, FROZEN]
+    tmp = FROZEN + ".part"
+    cmd = ["grim", "-t", "ppm"] + (["-c"] if pointer else []) + ["-o", name, tmp]
+    err = ""
     try:
-        return subprocess.run(cmd, env=CLEAN_ENV, timeout=5,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        r = subprocess.run(cmd, env=CLEAN_ENV, timeout=2, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        ok, err = r.returncode == 0, r.stderr.decode(errors="replace").strip()[:200]
     except subprocess.TimeoutExpired:
-        return False
+        ok, err = False, "timeout"
+    if ok:
+        os.replace(tmp, FROZEN)  # недописанный кадр никогда не попадёт на экран
+    log("кадр", name, "ok" if ok else "НЕТ", err)
+    return ok
 
 
 def recording_pid():
@@ -212,6 +231,7 @@ class Selector:
         self.shade.queue_draw()
 
     def on_begin(self, g, x, y):
+        log("тянуть", int(x), int(y), self.mode)
         self.start = (x, y)
         if self.mode == "area":
             self.panel.dragging(True)  # как в GNOME: пока тянешь рамку, панели не видно
@@ -271,6 +291,7 @@ class Panel(Gtk.ApplicationWindow):
         self.set_hide_on_close(True)
         self.mode, self.video, self.pointer = "area", False, False
         self.frozen = None   # замороженный кадр монитора (GdkPixbuf)
+        self.opening = False  # кадр снимается, панель ещё не показана
         self.active = False
         self.mon = None
         self.sel = Selector(self)
@@ -407,31 +428,67 @@ class Panel(Gtk.ApplicationWindow):
         if pid:  # во время записи сочетание её останавливает
             os.kill(pid, signal.SIGINT)
             return True
-        if self.active:
+        if self.active or self.opening:
             self.close_all()
             return True
-        self.active = True
-        self.mon = next((m for m in (hypr("monitors") or []) if m.get("focused")), None)
+        self.mon = self.monitor_under_cursor()
+        log("открыть", self.mon and self.mon["name"], "видео" if self.video else "фото", self.mode)
         if self.mon:
             gm = next((m for m in iter_monitors() if m.get_connector() == self.mon["name"]), None)
             if gm:
                 LS.set_monitor(self, gm)
-        if not self.video:
-            self.freeze_now()  # панель ещё не показана, на кадр она не попадёт
         self.sel.reset(self.mon, self.mode)
         self.dragging(False)
-        self.present()
+        if self.video or not self.mon:
+            self.show_panel()
+            return True
+        # кадр снимается в фоне: окно не блокируется, панель появится, когда кадр готов
+        self.opening = True
+        mon, pointer = self.mon, self.pointer
+
+        def work():
+            ok = grab_monitor(mon["name"], pointer)
+            GLib.idle_add(lambda: (self.frame_ready(ok), False)[1])
+        threading.Thread(target=work, daemon=True).start()
         return True
 
-    def freeze_now(self):
-        self.unfreeze()
-        if not self.mon or not grab_monitor(self.mon["name"], self.pointer):
-            return  # не вышло: снимем вживую
+    def monitor_under_cursor(self):
+        mons = hypr("monitors") or []
+        try:
+            x, y = (int(v) for v in subprocess.run(["hyprctl", "cursorpos"], capture_output=True, text=True,
+                                                    env=CLEAN_ENV, timeout=2).stdout.split(","))
+            for m in mons:
+                if m["x"] <= x < m["x"] + m["width"] and m["y"] <= y < m["y"] + m["height"]:
+                    return m
+        except (ValueError, subprocess.TimeoutExpired):
+            pass
+        return next((m for m in mons if m.get("focused")), mons[0] if mons else None)
+
+    def load_frame(self):
         try:
             self.frozen = GdkPixbuf.Pixbuf.new_from_file(FROZEN)
             self.bg.set_paintable(Gdk.Texture.new_from_filename(FROZEN))
         except GLib.Error:
             self.frozen = None
+
+    def frame_ready(self, ok):
+        if not self.opening:
+            return  # успели закрыть
+        self.opening = False
+        self.unfreeze()
+        if ok:
+            self.load_frame()
+        self.show_panel()
+
+    def show_panel(self):
+        self.active = True
+        self.present()
+
+    def freeze_now(self):
+        """новый кадр при переключении с видео на фото (панель уже спрятана)"""
+        self.unfreeze()
+        if self.mon and grab_monitor(self.mon["name"], self.pointer):
+            self.load_frame()
 
     def unfreeze(self):
         self.frozen = None
@@ -439,11 +496,13 @@ class Panel(Gtk.ApplicationWindow):
 
     def close_all(self):
         self.active = False
+        self.opening = False
         self.unfreeze()
         self.set_visible(False)
 
     # ---------- съёмка: только по Пробелу, Enter или большой кнопке
     def capture(self):
+        log("снять", self.mode, self.sel.geometry())
         if self.mode == "display":
             self.shoot_now(output=self.mon["name"] if self.mon else None)
             return
