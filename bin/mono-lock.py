@@ -94,6 +94,23 @@ def hypr_json(what):
         return None
 
 
+def hypr_cmd(cmd):
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            s.connect(HYPR_SOCK)
+            s.sendall(cmd.encode())
+            s.recv(4096)
+    except OSError:
+        pass
+
+
+def layout_index():
+    d = hypr_json("devices") or {}
+    kb = next((k for k in d.get("keyboards", []) if k.get("main")), None)
+    return kb.get("active_layout_index", 0) if kb else 0
+
+
 def big_clock():
     rows = ["", "", "", "", ""]
     for ch in time.strftime("%H:%M"):
@@ -114,7 +131,7 @@ def layout_name():
 
 
 class Screen(Gtk.Window):
-    """один экран блокировки на монитор; поле пароля только на основном"""
+    """один экран блокировки на монитор, на каждом своё поле пароля"""
 
     def __init__(self, app, lock, monitor, frames, main):
         super().__init__(application=app)
@@ -149,15 +166,11 @@ class Screen(Gtk.Window):
             self.hint = Gtk.Label(label="")
             self.hint.add_css_class("hint")
             col.append(self.hint)
-            keys = Gtk.EventControllerKey()
-            keys.connect("key-released", lambda *_: self.update_hint())
-            self.add_controller(keys)
-            self.update_hint()
         self.set_child(col)
 
-    def update_hint(self):
+    def set_hint(self, layout):
         if self.main:
-            self.hint.set_text(f"раскладка {layout_name()} · enter")
+            self.hint.set_text(f"раскладка {layout} · enter")
 
     def tick_clock(self):
         self.clock.set_text(big_clock())
@@ -193,6 +206,7 @@ class LockApp(Gtk.Application):
         self.screens = []
         self.busy = False
         self.frame = 0
+        self.prev_layout = 0
         try:
             self.frames = json.load(open(EARTH))["frames"]
         except (OSError, ValueError, KeyError):
@@ -208,7 +222,7 @@ class LockApp(Gtk.Application):
         self.lock.connect("monitor", self.on_monitor)
         self.lock.connect("locked", self.on_locked)
         self.lock.connect("failed", lambda *_: self.quit())
-        self.lock.connect("unlocked", lambda *_: self.quit())
+        self.lock.connect("unlocked", lambda *_: self.on_unlocked())
         if not self.lock.lock():
             self.quit()
             return
@@ -219,23 +233,37 @@ class LockApp(Gtk.Application):
             GLib.timeout_add_seconds(int(test), lambda: (self.lock.unlock(), False)[1])
 
     def on_monitor(self, _lock, monitor):
-        main = monitor.get_connector() == MAIN_OUTPUT or (
-            not any(s.main for s in self.screens) and MAIN_OUTPUT not in
-            [m.get_connector() for m in Gdk.Display.get_default().get_monitors()])
-        s = Screen(self, self.lock, monitor, self.frames, main)
+        # поле пароля на КАЖДОМ мониторе: Hyprland отдаёт клавиатуру экрану блокировки того
+        # монитора, где фокус. Если поле только на одном, ввод может уйти на экран без поля
+        # (например, на спящий второй монитор) и разблокироваться будет нечем.
+        s = Screen(self, self.lock, monitor, self.frames, True)
         self.screens.append(s)
         s.present()
-        if main:
-            s.pw.grab_focus()
+        s.pw.grab_focus()
 
     def on_locked(self, _lock):
         # экран уже под замком: обёртка mono-lock отпускает swayidle, и только тогда идёт сон
         open(READY, "w").close()
+        # пароль латиницей: включаем первую раскладку (us), после разблокировки вернём прежнюю
+        self.prev_layout = layout_index()
+        hypr_cmd("switchxkblayout all 0")
+        self.tick_layout()
 
     def tick_clock(self):
         for s in self.screens:
             s.tick_clock()
+        self.tick_layout()
         return True
+
+    def tick_layout(self):
+        lay = layout_name()
+        for s in self.screens:
+            s.set_hint(lay)
+
+    def on_unlocked(self):
+        if self.prev_layout:
+            hypr_cmd(f"switchxkblayout all {self.prev_layout}")
+        self.quit()
 
     def tick_earth(self):
         self.frame += 1
