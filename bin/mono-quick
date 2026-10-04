@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+# mono-quick: быстрые настройки как в GNOME Shell (кнопка питания в доке, Super+X).
+#   сверху: снимок, настройки, замок, питание (подменю: сон, перезагрузка, выключение, выход);
+#   ползунки звука и микрофона со стрелкой выбора устройства;
+#   плитки: Wi-Fi (стрелка: сети), VPN, режим питания (стрелка: режимы), не беспокоить.
+# Иконки: Adwaita symbolic из самого GNOME.
+#   mono-quick            фоновый процесс, окно держится наготове
+#   mono-quick toggle     показать / спрятать
+import os
+import signal
+import sys
+
+RUN = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+PID = os.path.join(RUN, "mono-quick.pid")
+
+if sys.argv[1:2] == ["toggle"]:
+    try:
+        os.kill(int(open(PID).read()), signal.SIGUSR1)
+        sys.exit(0)
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        pass  # не запущен: запускаемся и сразу показываем
+
+LIB = "/usr/lib64/libgtk4-layer-shell.so.0"
+if os.path.exists(LIB) and LIB not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = (LIB + " " + os.environ.get("LD_PRELOAD", "")).strip()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+import glob  # noqa: E402
+import re  # noqa: E402
+import subprocess  # noqa: E402
+import threading  # noqa: E402
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_version("Graphene", "1.0")
+from gi.repository import Gdk, Gio, GLib, Graphene, Gtk  # noqa: E402
+from gi.repository import Gtk4LayerShell as LS  # noqa: E402
+
+HOME = os.path.expanduser("~")
+MAIN_OUTPUT = os.environ.get("MONO_MAIN_OUTPUT", "")
+CLEAN_ENV = {k: v for k, v in os.environ.items() if k != "LD_PRELOAD"}
+ICON_DIRS = ["/usr/share/icons/Adwaita/symbolic", "/usr/share/icons/hicolor/symbolic"]
+DOCK_W = 76
+
+# метрики quick-settings из GNOME Shell 49, цвета чёрно-белые
+CSS = b"""
+window { background: transparent; }
+.qs button, .qs label, .qs image, .qs scale { background-image: none; box-shadow: none; text-shadow: none; outline: none; }
+.qs {
+  background: #000000; color: #ffffff; border: 1px solid rgba(255,255,255,0.18);
+  border-radius: 28px; padding: 14px; font-size: 11pt;
+}
+.qs-top { margin-bottom: 12px; }
+.qs-circle {
+  background: rgba(255,255,255,0.1); color: #ffffff; border: none; border-radius: 999px;
+  min-width: 40px; min-height: 40px; padding: 0; margin-left: 8px;
+}
+.qs-circle:hover { background: rgba(255,255,255,0.18); }
+.qs-circle.open { background: #ffffff; color: #000000; }
+.qs-slider-row { margin: 2px 0 6px 0; }
+.qs-flat {
+  background: transparent; color: #ffffff; border: none; border-radius: 999px;
+  min-width: 36px; min-height: 36px; padding: 0;
+}
+.qs-flat:hover { background: rgba(255,255,255,0.12); }
+.qs-flat.open { background: #ffffff; color: #000000; }
+.qs scale { padding: 0 8px; }
+.qs scale trough { background: rgba(255,255,255,0.15); border-radius: 999px; min-height: 4px; }
+.qs scale highlight { background: #ffffff; border-radius: 999px; min-height: 4px; }
+.qs scale slider {
+  background: #ffffff; border: none; border-radius: 999px; min-width: 20px; min-height: 20px; margin: -8px;
+}
+.qs-toggle {
+  background: rgba(255,255,255,0.1); color: #ffffff; border-radius: 999px; min-height: 48px;
+}
+.qs-toggle.on { background: #ffffff; color: #000000; }
+.qs-toggle-main { background: transparent; color: inherit; border: none; border-radius: 999px; padding: 0 6px 0 14px; }
+.qs-toggle-main:hover { background: rgba(255,255,255,0.08); }
+.qs-toggle.on .qs-toggle-main:hover { background: rgba(0,0,0,0.08); }
+.qs-toggle-arrow {
+  background: transparent; color: inherit; border: none; border-radius: 999px;
+  min-width: 40px; min-height: 48px; padding: 0;
+}
+.qs-toggle-arrow:hover { background: rgba(255,255,255,0.08); }
+.qs-toggle.on .qs-toggle-arrow:hover { background: rgba(0,0,0,0.08); }
+.qs-title { font-weight: bold; font-size: 10.5pt; }
+.qs-sub { font-size: 9pt; }
+.qs-sep { background: rgba(255,255,255,0.12); min-height: 1px; margin: 8px 6px; }
+.qs-sub-menu {
+  background: rgba(255,255,255,0.06); border-radius: 18px; padding: 8px; margin: 4px 0 8px 0;
+}
+.qs-sub-head { font-weight: bold; margin: 4px 10px 8px 10px; }
+.qs-item {
+  background: transparent; color: #ffffff; border: none; border-radius: 10px;
+  min-height: 36px; padding: 0 12px;
+}
+.qs-item:hover { background: rgba(255,255,255,0.1); }
+.qs-item label { font-weight: normal; }
+"""
+
+
+def icon_file(name):
+    for d in ICON_DIRS:
+        hits = glob.glob(f"{d}/*/{name}-symbolic.svg") + glob.glob(f"{d}/{name}-symbolic.svg")
+        if hits:
+            return hits[0]
+    return None
+
+
+_icons = {}
+
+
+def icon(name, size=16):
+    if name not in _icons:
+        f = icon_file(name)
+        _icons[name] = Gio.FileIcon.new(Gio.File.new_for_path(f)) if f else None
+    img = Gtk.Image.new_from_gicon(_icons[name]) if _icons[name] else Gtk.Image()
+    img.set_pixel_size(size)
+    return img
+
+
+def out(*cmd, timeout=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL, env=CLEAN_ENV)
+        return r.stdout.decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def spawn(cmd):
+    subprocess.Popen(["sh", "-c", cmd], env=CLEAN_ENV, start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def bg(work, done):
+    """work() в потоке, done(result) в главном цикле"""
+    def run():
+        r = work()
+        GLib.idle_add(lambda: (done(r), False)[1])
+    threading.Thread(target=run, daemon=True).start()
+
+
+# ---------------------------------------------------------------- состояние системы
+def wpctl_section(name):
+    """устройства из `wpctl status`: [(id, имя, по умолчанию)]"""
+    res, inside = [], False
+    for line in out("wpctl", "status").splitlines():
+        s = line.strip(" │├└─")
+        if s.startswith(name + ":"):
+            inside = True
+            continue
+        if inside:
+            if not s or s.endswith(":"):
+                if res or s.endswith(":"):
+                    break
+                continue
+            m = re.match(r"(\*?)\s*(\d+)\.\s+(.+?)(\s+\[vol:.*\])?$", s)
+            if m:
+                res.append((m.group(2), m.group(3).strip(), bool(m.group(1))))
+    return res
+
+
+def volume(target):
+    s = out("wpctl", "get-volume", target)
+    m = re.search(r"([\d.]+)", s)
+    return (float(m.group(1)) if m else 0.0), ("MUTED" in s)
+
+
+def read_state():
+    st = {}
+    st["vol"], st["mute"] = volume("@DEFAULT_AUDIO_SINK@")
+    st["mic"], st["mic_mute"] = volume("@DEFAULT_AUDIO_SOURCE@")
+    st["sinks"] = wpctl_section("Sinks")
+    st["sources"] = wpctl_section("Sources")
+    st["wifi_on"] = "enabled" in out("nmcli", "radio", "wifi")
+    st["ssid"], st["signal"] = "", 0
+    nets = {}
+    for line in out("nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL,SECURITY", "dev", "wifi", "list", "--rescan", "no").splitlines():
+        parts = re.split(r"(?<!\\):", line)
+        if len(parts) < 4 or not parts[1]:
+            continue
+        ssid = parts[1].replace("\\:", ":")
+        sig = int(parts[2] or 0)
+        if parts[0] in ("yes", "да"):
+            st["ssid"], st["signal"] = ssid, sig
+        if ssid not in nets or nets[ssid][0] < sig:
+            nets[ssid] = (sig, bool(parts[3]))
+    st["nets"] = sorted(nets.items(), key=lambda x: -x[1][0])[:8]
+    st["saved"] = set(out("nmcli", "-t", "-f", "NAME", "con", "show").splitlines())
+    st["vpn"] = os.path.exists("/sys/class/net/tun0")
+    st["profile"] = out("powerprofilesctl", "get").strip()
+    st["profiles"] = re.findall(r"^\*?\s*([\w-]+):\s*$", out("powerprofilesctl", "list"), re.M)
+    st["dnd"] = out("swaync-client", "-D").strip() == "true"
+    return st
+
+
+PROFILE_NAMES = {"performance": "Производительность", "balanced": "Сбалансированный", "power-saver": "Энергосбережение"}
+
+
+def vol_icon(v, mute):
+    if mute or v <= 0:
+        return "audio-volume-muted"
+    return "audio-volume-low" if v < 0.34 else "audio-volume-medium" if v < 0.67 else "audio-volume-high"
+
+
+def wifi_icon(on, sig, ssid):
+    if not on:
+        return "network-wireless-disabled"
+    if not ssid:
+        return "network-wireless-offline"
+    return ("network-wireless-signal-weak" if sig < 30 else "network-wireless-signal-ok" if sig < 55
+            else "network-wireless-signal-good" if sig < 80 else "network-wireless-signal-excellent")
+
+
+# ---------------------------------------------------------------- виджеты
+class Toggle(Gtk.Box):
+    """плитка-пилюля GNOME: иконка, заголовок, подпись; у части есть стрелка подменю"""
+
+    def __init__(self, on_click, on_arrow=None):
+        super().__init__(hexpand=True)
+        self.add_css_class("qs-toggle")
+        self.main = Gtk.Button(hexpand=True)
+        self.main.add_css_class("qs-toggle-main")
+        self.main.connect("clicked", lambda *_: on_click())
+        row = Gtk.Box(spacing=10)
+        self.img = Gtk.Box()
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
+        self.title = Gtk.Label(xalign=0, ellipsize=3, max_width_chars=14)
+        self.title.add_css_class("qs-title")
+        self.sub = Gtk.Label(xalign=0, ellipsize=3, max_width_chars=16)
+        self.sub.add_css_class("qs-sub")
+        col.append(self.title)
+        col.append(self.sub)
+        row.append(self.img)
+        row.append(col)
+        self.main.set_child(row)
+        self.append(self.main)
+        self.arrow = None
+        if on_arrow:
+            self.arrow = Gtk.Button()
+            self.arrow.add_css_class("qs-toggle-arrow")
+            self.arrow.set_child(icon("go-next"))
+            self.arrow.connect("clicked", lambda *_: on_arrow())
+            self.append(self.arrow)
+
+    def set(self, icon_name, title, sub, on):
+        c = self.img.get_first_child()
+        if c:
+            self.img.remove(c)
+        self.img.append(icon(icon_name))
+        self.title.set_text(title)
+        self.sub.set_text(sub)
+        self.sub.set_visible(bool(sub))
+        (self.add_css_class if on else self.remove_css_class)("on")
+
+
+class Quick(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        LS.init_for_window(self)
+        LS.set_namespace(self, "mono-quick")
+        LS.set_layer(self, LS.Layer.OVERLAY)
+        for e in (LS.Edge.LEFT, LS.Edge.RIGHT, LS.Edge.TOP, LS.Edge.BOTTOM):
+            LS.set_anchor(self, e, True)
+        LS.set_exclusive_zone(self, -1)
+        LS.set_keyboard_mode(self, LS.KeyboardMode.EXCLUSIVE)
+        self.set_hide_on_close(True)
+        self.st = None
+        self.open_sub = None
+        self.busy = False  # не дёргать ползунки, пока ставим значения из системы
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+        shade = Gtk.Box(hexpand=True, vexpand=True)
+        outside = Gtk.GestureClick(button=0)
+        outside.connect("pressed", self.on_outside)
+        shade.add_controller(outside)
+        self.set_child(shade)
+
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.box.add_css_class("qs")
+        self.box.set_size_request(400, -1)
+        self.box.set_halign(Gtk.Align.START)
+        self.box.set_valign(Gtk.Align.END)
+        self.box.set_margin_start(DOCK_W + 8)
+        self.box.set_margin_bottom(8)
+        shade.append(self.box)
+
+        # ---- верхний ряд: снимок, настройки, замок, питание
+        top = Gtk.Box()
+        top.add_css_class("qs-top")
+        top.append(Gtk.Box(hexpand=True))
+        for name, cb in (("camera-photo", self.on_shot), ("org.gnome.Settings", self.on_settings),
+                         ("system-lock-screen", self.on_lock)):
+            b = Gtk.Button(child=icon(name))
+            b.add_css_class("qs-circle")
+            b.connect("clicked", lambda _b, f=cb: f())
+            top.append(b)
+        self.power_btn = Gtk.Button(child=icon("system-shutdown"))
+        self.power_btn.add_css_class("qs-circle")
+        self.power_btn.connect("clicked", lambda *_: self.show_sub("power"))
+        top.append(self.power_btn)
+        self.box.append(top)
+        self.subs = {}
+        self.sub_owner = {"power": self.power_btn}
+        self.box.append(self.make_sub("power", "Выключение", self.power_items))
+
+        # ---- ползунки
+        self.vol = self.slider_row("sink", self.on_vol, self.on_mute)
+        self.box.append(self.make_sub("sink", "Вывод звука", self.sink_items))
+        self.mic = self.slider_row("source", self.on_mic, self.on_mic_mute)
+        self.box.append(self.make_sub("source", "Ввод звука", self.source_items))
+
+        # ---- плитки 2 колонки
+        grid = Gtk.Grid(column_spacing=12, row_spacing=12, column_homogeneous=True)
+        grid.set_margin_top(10)
+        self.t_wifi = Toggle(self.on_wifi, lambda: self.show_sub("wifi"))
+        self.t_vpn = Toggle(self.on_vpn)
+        self.t_power = Toggle(self.on_profile_cycle, lambda: self.show_sub("profile"))
+        self.t_dnd = Toggle(self.on_dnd)
+        grid.attach(self.t_wifi, 0, 0, 1, 1)
+        grid.attach(self.t_vpn, 1, 0, 1, 1)
+        grid.attach(self.t_power, 0, 1, 1, 1)
+        grid.attach(self.t_dnd, 1, 1, 1, 1)
+        self.sub_owner["wifi"] = self.t_wifi.arrow
+        self.sub_owner["profile"] = self.t_power.arrow
+        self.box.append(grid)
+        self.box.append(self.make_sub("wifi", "Wi-Fi", self.wifi_items))
+        self.box.append(self.make_sub("profile", "Режим питания", self.profile_items))
+
+    # ---------- строители
+    def slider_row(self, kind, on_change, on_mute):
+        row = Gtk.Box(spacing=4)
+        row.add_css_class("qs-slider-row")
+        mute = Gtk.Button()
+        mute.add_css_class("qs-flat")
+        mute.connect("clicked", lambda *_: on_mute())
+        scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.01)
+        scale.set_hexpand(True)
+        scale.set_draw_value(False)
+        scale.connect("value-changed", lambda s: None if self.busy else on_change(s.get_value()))
+        arrow = Gtk.Button(child=icon("go-next"))
+        arrow.add_css_class("qs-flat")
+        arrow.connect("clicked", lambda *_: self.show_sub(kind))
+        self.sub_owner[kind] = arrow
+        row.append(mute)
+        row.append(scale)
+        row.append(arrow)
+        self.box.append(row)
+        return mute, scale
+
+    def make_sub(self, key, head, filler):
+        rev = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN, transition_duration=180)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.add_css_class("qs-sub-menu")
+        rev.set_child(box)
+        self.subs[key] = (rev, box, head, filler)
+        return rev
+
+    def item(self, text, cb, icon_name=None, checked=False):
+        b = Gtk.Button()
+        b.add_css_class("qs-item")
+        row = Gtk.Box(spacing=10)
+        if icon_name:
+            row.append(icon(icon_name))
+        lab = Gtk.Label(label=text, xalign=0, hexpand=True, ellipsize=3)
+        row.append(lab)
+        if checked:
+            row.append(icon("object-select"))
+        b.set_child(row)
+        b.connect("clicked", lambda *_: cb())
+        return b
+
+    def show_sub(self, key):
+        same = self.open_sub == key
+        for k, (rev, *_r) in self.subs.items():
+            rev.set_reveal_child(False)
+            if self.sub_owner.get(k):
+                self.sub_owner[k].remove_css_class("open")
+        self.open_sub = None
+        if same or not self.st:
+            return
+        rev, box, head, filler = self.subs[key]
+        while box.get_first_child():
+            box.remove(box.get_first_child())
+        h = Gtk.Label(label=head, xalign=0)
+        h.add_css_class("qs-sub-head")
+        box.append(h)
+        for w in filler():
+            box.append(w)
+        rev.set_reveal_child(True)
+        self.sub_owner[key].add_css_class("open")
+        self.open_sub = key
+
+    # ---------- содержимое подменю
+    def power_items(self):
+        return [self.item("Сон", lambda: self.run("systemctl suspend"), "weather-clear-night"),
+                self.item("Перезагрузка", lambda: self.run("systemctl reboot"), "system-reboot"),
+                self.item("Выключение", lambda: self.run("systemctl poweroff"), "system-shutdown"),
+                self.item("Выйти из системы", lambda: self.run("hyprctl dispatch exit"), "system-log-out")]
+
+    def sink_items(self):
+        return [self.item(name, lambda i=i: self.set_default(i), checked=d) for i, name, d in self.st["sinks"]]
+
+    def source_items(self):
+        return [self.item(name, lambda i=i: self.set_default(i), checked=d) for i, name, d in self.st["sources"]]
+
+    def wifi_items(self):
+        res = []
+        for ssid, (sig, secure) in self.st["nets"]:
+            res.append(self.item(ssid, lambda s=ssid: self.wifi_connect(s), wifi_icon(True, sig, ssid),
+                                 checked=ssid == self.st["ssid"]))
+        sep = Gtk.Box()
+        sep.add_css_class("qs-sep")
+        res += [sep, self.item("Все сети", lambda: self.run(f"{HOME}/.local/bin/mono-settings wifi"))]
+        return res
+
+    def profile_items(self):
+        return [self.item(PROFILE_NAMES.get(p, p), lambda p=p: self.set_profile(p), f"power-profile-{p}",
+                          checked=p == self.st["profile"]) for p in self.st["profiles"]]
+
+    # ---------- обновление
+    def refresh(self):
+        bg(read_state, self.apply)
+
+    def apply(self, st):
+        self.st = st
+        self.busy = True
+        for (mute, scale), v, m, ic in ((self.vol, st["vol"], st["mute"], vol_icon(st["vol"], st["mute"])),
+                                        (self.mic, st["mic"], st["mic_mute"],
+                                         "microphone-sensitivity-muted" if st["mic_mute"] else "audio-input-microphone")):
+            mute.set_child(icon(ic))
+            scale.set_value(min(v, 1.0))
+        self.busy = False
+        self.t_wifi.set(wifi_icon(st["wifi_on"], st["signal"], st["ssid"]), "Wi-Fi",
+                        st["ssid"] if st["wifi_on"] else "", st["wifi_on"])
+        self.t_vpn.set("network-vpn", "VPN", "подключён" if st["vpn"] else "", st["vpn"])
+        p = st["profile"] or "balanced"
+        self.t_power.set(f"power-profile-{p}", "Питание", PROFILE_NAMES.get(p, p), p != "balanced")
+        self.t_dnd.set("notifications-disabled", "Не беспокоить", "", st["dnd"])
+        if self.open_sub:  # перерисовать открытое подменю
+            k = self.open_sub
+            self.open_sub = None
+            self.show_sub(k)
+
+    # ---------- действия
+    def run(self, cmd):
+        self.set_visible(False)
+        spawn(cmd)
+
+    def later(self, cmd):
+        """команда без закрытия меню, затем перечитать состояние"""
+        bg(lambda: out("sh", "-c", cmd, timeout=15), lambda _r: self.refresh())
+
+    def on_shot(self):
+        self.set_visible(False)
+        spawn(f"sleep 0.25; {HOME}/.local/bin/mono-screenshot toggle")
+
+    def on_settings(self):
+        self.run(f"{HOME}/.local/bin/mono-settings")
+
+    def on_lock(self):
+        self.run(f"{HOME}/.local/bin/mono-lock")
+
+    def on_vol(self, v):
+        spawn(f"wpctl set-mute @DEFAULT_AUDIO_SINK@ 0; wpctl set-volume @DEFAULT_AUDIO_SINK@ {v:.2f}")
+        self.vol[0].set_child(icon(vol_icon(v, False)))
+
+    def on_mic(self, v):
+        spawn(f"wpctl set-mute @DEFAULT_AUDIO_SOURCE@ 0; wpctl set-volume @DEFAULT_AUDIO_SOURCE@ {v:.2f}")
+
+    def on_mute(self):
+        self.later("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle")
+
+    def on_mic_mute(self):
+        self.later("wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle")
+
+    def set_default(self, node):
+        self.later(f"wpctl set-default {node}")
+
+    def on_wifi(self):
+        self.later("nmcli radio wifi " + ("off" if self.st and self.st["wifi_on"] else "on"))
+
+    def wifi_connect(self, ssid):
+        q = GLib.shell_quote(ssid)
+        if ssid in self.st["saved"]:
+            self.later(f"nmcli con up id {q}")
+        else:  # новая сеть: пароль спросят настройки GNOME
+            self.run(f"{HOME}/.local/bin/mono-settings wifi")
+
+    def on_vpn(self):
+        if self.st and not self.st["vpn"]:
+            self.run(f"{HOME}/.local/bin/mono-settings network")
+
+    def set_profile(self, p):
+        self.later(f"powerprofilesctl set {p}")
+
+    def on_profile_cycle(self):
+        if self.st and self.st["profiles"]:
+            ps = self.st["profiles"]
+            cur = self.st["profile"]
+            self.set_profile(ps[(ps.index(cur) + 1) % len(ps)] if cur in ps else ps[0])
+
+    def on_dnd(self):
+        self.later("swaync-client -df" if self.st and self.st["dnd"] else "swaync-client -dn")
+
+    # ---------- показать / спрятать
+    def toggle(self):
+        if self.get_visible():
+            self.set_visible(False)
+            return True
+        if self.open_sub:  # подменю закрыты при каждом открытии, как в GNOME
+            self.show_sub(self.open_sub)
+        mons = Gdk.Display.get_default().get_monitors()
+        for i in range(mons.get_n_items()):
+            m = mons.get_item(i)
+            if m.get_connector() == MAIN_OUTPUT:
+                LS.set_monitor(self, m)
+        self.refresh()
+        self.present()
+        return True
+
+    def on_outside(self, g, n, x, y):
+        ok, r = self.box.compute_bounds(self.get_child())
+        if not ok or not r.contains_point(Graphene.Point().init(x, y)):
+            self.set_visible(False)
+
+    def on_key(self, ctrl, kv, kc, state):
+        if kv == Gdk.KEY_Escape:
+            self.set_visible(False)
+            return True
+        return False
+
+
+def main():
+    try:
+        os.kill(int(open(PID).read()), 0)
+        print("mono-quick уже запущен")
+        return
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        pass
+    open(PID, "w").write(str(os.getpid()))
+    show_now = sys.argv[1:2] == ["toggle"]
+
+    css = Gtk.CssProvider()
+    css.load_from_data(CSS)
+    app = Gtk.Application(application_id="dev.mono.quick", flags=Gio.ApplicationFlags.NON_UNIQUE)
+
+    def activate(a):
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        win = Quick(a)
+        a.hold()
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, win.toggle)
+        win.refresh()
+        if show_now:
+            win.toggle()
+
+    app.connect("activate", activate)
+    try:
+        app.run([])
+    finally:
+        try:
+            if open(PID).read().strip() == str(os.getpid()):
+                os.remove(PID)
+        except (FileNotFoundError, ValueError):
+            pass
+
+
+if __name__ == "__main__":
+    main()

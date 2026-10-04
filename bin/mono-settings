@@ -1,0 +1,3 @@
+#!/bin/sh
+# Настройки GNOME в Hyprland (звук, микрофон, сеть, Bluetooth, экраны...). Вне GNOME им нужна эта подмена.
+XDG_CURRENT_DESKTOP=GNOME exec gnome-control-center "$@"

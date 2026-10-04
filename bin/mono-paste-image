@@ -1,0 +1,9 @@
+#!/bin/sh
+# Ctrl+V в Ghostty с картинкой в буфере: Ghostty вставляет только текст, поэтому
+# досылаем Ctrl+Shift+V (он передаёт ^V программе, и Claude Code берёт картинку).
+# Бинд неперехватывающий (bindn): в остальных программах Ctrl+V работает как обычно.
+hyprctl -j activewindow | grep -q '"class": "com.mitchellh.ghostty"' || exit 0
+types=$(wl-paste -l 2>/dev/null)
+echo "$types" | grep -q '^image/' || exit 0
+echo "$types" | grep -q '^text/' && exit 0
+hyprctl dispatch sendshortcut CTRL SHIFT, V, activewindow >/dev/null

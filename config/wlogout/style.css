@@ -1,0 +1,25 @@
+/* blackrise: экран выключения, большие круглые кнопки */
+* { font-family: "Hack Nerd Font Mono", monospace; background-image: none; box-shadow: none; }
+window { background-color: rgba(0, 0, 0, 0.82); }
+button {
+  color: #ffffff;
+  background-color: #000000;
+  border: 2px solid #ffffff;
+  border-radius: 999px;
+  margin: 26px;
+  font-size: 15px;
+  background-repeat: no-repeat;
+  background-position: center 38%;
+  background-size: 22%;
+}
+button:focus, button:hover { background-color: #ffffff; color: #000000; outline: none; }
+#lock     { background-image: url("@HOME@/.local/share/mono-icons/gnome/white/system-lock-screen.svg"); }
+#logout   { background-image: url("@HOME@/.local/share/mono-icons/gnome/white/system-log-out.svg"); }
+#suspend  { background-image: url("@HOME@/.local/share/mono-icons/gnome/white/weather-clear-night.svg"); }
+#reboot   { background-image: url("@HOME@/.local/share/mono-icons/gnome/white/system-reboot.svg"); }
+#shutdown { background-image: url("@HOME@/.local/share/mono-icons/gnome/white/system-shutdown.svg"); }
+#lock:hover, #lock:focus         { background-image: url("@HOME@/.local/share/mono-icons/gnome/black/system-lock-screen.svg"); }
+#logout:hover, #logout:focus     { background-image: url("@HOME@/.local/share/mono-icons/gnome/black/system-log-out.svg"); }
+#suspend:hover, #suspend:focus   { background-image: url("@HOME@/.local/share/mono-icons/gnome/black/weather-clear-night.svg"); }
+#reboot:hover, #reboot:focus     { background-image: url("@HOME@/.local/share/mono-icons/gnome/black/system-reboot.svg"); }
+#shutdown:hover, #shutdown:focus { background-image: url("@HOME@/.local/share/mono-icons/gnome/black/system-shutdown.svg"); }

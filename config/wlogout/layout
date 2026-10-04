@@ -1,0 +1,5 @@
+{ "label": "lock",     "action": "~/.local/bin/mono-lock",          "text": "Блок",         "keybind": "l" }
+{ "label": "logout",   "action": "hyprctl dispatch exit",          "text": "Выход",        "keybind": "e" }
+{ "label": "suspend",  "action": "systemctl suspend",              "text": "Сон",          "keybind": "u" }
+{ "label": "reboot",   "action": "systemctl reboot",               "text": "Перезагрузка", "keybind": "r" }
+{ "label": "shutdown", "action": "systemctl poweroff",             "text": "Выключение",   "keybind": "s" }

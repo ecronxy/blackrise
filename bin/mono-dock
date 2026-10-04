@@ -1,0 +1,1669 @@
+#!/usr/bin/env python3
+# mono-dock: чёрно-белый док слева для Hyprland + буфер обмена + снимок/запись экрана + индикатор звука.
+#   док: сверху все приложения, закреплённые программы, буфер; под линией открытые окна;
+#        по центру часы; снизу стоп записи, раскладка, питание.
+#        клик: открыть / свернуть / развернуть; средняя кнопка: закрыть; правый клик: меню.
+#   сигналы: USR2 буфер обмена (Super+V), USR1 снимок/запись (Ctrl/Super+Shift+S), HUP индикатор звука,
+#            WINCH обзор окон (Super).
+# Иконки программ: github.com/glincker/thesvg (MIT), вариант mono.
+import os
+import signal
+import sys
+
+PID = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "mono-dock.pid")
+LIB = "/usr/lib64/libgtk4-layer-shell.so.0"
+if os.path.exists(LIB) and LIB not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = (LIB + " " + os.environ.get("LD_PRELOAD", "")).strip()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+# библиотека уже загружена; дальше переменная не нужна, а каждой запущенной программе она добавляет ~60 мс
+os.environ.pop("LD_PRELOAD", None)
+
+import json  # noqa: E402
+import math  # noqa: E402
+import shlex  # noqa: E402
+import shutil  # noqa: E402
+import socket  # noqa: E402
+import subprocess  # noqa: E402
+import threading  # noqa: E402
+from importlib.machinery import SourceFileLoader  # noqa: E402
+
+import cairo  # noqa: E402
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_version("Gsk", "4.0")
+gi.require_version("Graphene", "1.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, GObject, Graphene, Gsk, Gtk  # noqa: E402
+from gi.repository import Gtk4LayerShell as LS  # noqa: E402
+
+HOME = os.path.expanduser("~")
+ICONS = f"{HOME}/.local/share/mono-icons"
+BRAND_ALL = f"{ICONS}/brand-all/white"
+PINNED = f"{HOME}/.config/mono-dock/pinned.json"
+MAIN_OUTPUT = os.environ.get("MONO_MAIN_OUTPUT", "")  # пусто: первый монитор
+HIDE = "special:minimized"
+RUN = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+REC_PID = os.path.join(RUN, "mono-rec.pid")
+clip = SourceFileLoader("mono_clip", f"{HOME}/.local/bin/mono-clip").load_module()
+tray_mod = SourceFileLoader("mono_tray", f"{HOME}/.local/lib/mono/tray.py").load_module()
+
+DEFAULT_PINS = [
+    {"name": "Терминал", "icon": "lucide:terminal", "exec": f"{HOME}/.local/bin/mono-term",
+     "class": "com.mitchellh.ghostty"},
+    {"name": "Chrome", "icon": "lucide:globe", "exec": "google-chrome-stable", "class": "google-chrome"},
+    {"name": "Файлы", "icon": "lucide:folder", "exec": "nautilus --new-window", "class": "org.gnome.Nautilus"},
+    {"name": "Telegram", "icon": "lucide:telegram", "exec": "flatpak run org.telegram.desktop",
+     "class": "org.telegram.desktop"},
+]
+# класс окна -> иконка thesvg, если по имени не находится
+ALIASES = {"code": "visual-studio-code", "org.gnome.nautilus": "gnome", "com.mitchellh.ghostty": "ghostty",
+           "org.telegram.desktop": "telegram", "google-chrome": "google-chrome", "librewolf": "librewolf",
+           "steam": "steam", "discord": "discord", "obsidian": "obsidian", "spotify": "spotify"}
+
+CSS = b"""
+window { background: transparent; }
+button, label, image, entry, scrolledwindow, list, row, picture {
+  background-image: none; box-shadow: none; text-shadow: none; outline: none;
+}
+
+/* ---------- dock */
+.dock { background: #000000; color: #ffffff; font-family: "Hack Nerd Font Mono", monospace; }
+.dockbtn { background: transparent; border: none; padding: 0; margin: 2px 0; min-height: 56px; }
+.ring {
+  min-width: 52px; min-height: 52px; border-radius: 999px;
+  border: 1px solid transparent; background: transparent;
+}
+.dockbtn:hover .ring { border-color: #ffffff; }
+.ring.primary { background: #ffffff; }
+.appicon-color { filter: grayscale(1) contrast(1.3); }
+.dot { background: #ffffff; border-radius: 999px; min-width: 4px; min-height: 4px; }
+.dot.off { background: transparent; }
+.sep { background: #ffffff; min-height: 1px; margin: 10px 18px; }
+.clock { font-size: 22px; font-weight: bold; color: #ffffff; }
+.lang {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px;
+  min-width: 52px; min-height: 40px; font-weight: bold; padding: 0;
+}
+.lang:hover { background: #ffffff; color: #000000; }
+
+/* ---------- menu */
+.menu {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 26px; padding: 8px;
+  font-family: "Hack Nerd Font Mono", monospace; font-size: 13px;
+}
+.menutitle { font-weight: bold; margin: 6px 14px 8px 14px; }
+.menuitem {
+  background: #000000; color: #ffffff; border: none; border-radius: 999px; padding: 8px 16px;
+  font-family: "Hack Nerd Font Mono", monospace;
+}
+.menuitem:hover { background: #ffffff; color: #000000; }
+
+/* ---------- clipboard */
+.clip {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 28px; padding: 12px;
+  font-family: "Hack Nerd Font Mono", monospace; font-size: 13px;
+}
+.clip entry {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px;
+  min-height: 40px; padding: 0 16px; margin-bottom: 8px;
+}
+.clip list { background: #000000; }
+.clip row { background: #000000; color: #ffffff; border-radius: 999px; padding: 0; margin: 2px 0; }
+.clip row:hover { box-shadow: inset 0 0 0 1px #ffffff; }
+.clip row:selected { background: #ffffff; color: #000000; }
+.cliptext { padding: 10px 6px 10px 18px; }
+.clipthumb { margin: 6px 0 6px 12px; border-radius: 12px; }
+.clipdel {
+  background: transparent; color: inherit; border: none; border-radius: 999px;
+  min-width: 34px; min-height: 34px; padding: 0; margin: 4px 6px 4px 0; font-size: 15px;
+}
+.clipdel:hover { box-shadow: inset 0 0 0 1px currentColor; }
+.clipclear {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px;
+  min-height: 40px; margin-top: 8px;
+}
+.clipclear:hover { background: #ffffff; color: #000000; }
+.empty { margin: 24px 0; }
+
+/* ---------- screenshot overlay */
+.shotbar {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px; padding: 10px;
+  font-family: "Hack Nerd Font Mono", monospace; font-size: 13px; font-weight: bold;
+}
+.pill {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px;
+  min-height: 48px; padding: 0 18px;
+}
+.pill:hover { box-shadow: inset 0 0 0 1px #ffffff; }
+.pill.on { background: #ffffff; color: #000000; }
+.shotgo { background: #ffffff; border: none; border-radius: 999px; min-width: 60px; min-height: 60px; padding: 0; }
+.shotgo:hover { box-shadow: inset 0 0 0 2px #000000; }
+.shotclose {
+  background: #000000; border: 1px solid #ffffff; border-radius: 999px;
+  min-width: 48px; min-height: 48px; padding: 0;
+}
+.shotclose:hover { background: #ffffff; }
+.hint {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px;
+  padding: 8px 18px; font-family: "Hack Nerd Font Mono", monospace; font-size: 13px;
+}
+
+/* ---------- screenshot UI (GNOME-like) */
+.gsbar {
+  background: #000000; border: 1px solid rgba(255,255,255,0.22); border-radius: 999px; padding: 12px 18px;
+}
+.gsgroup { background: rgba(255,255,255,0.08); border-radius: 999px; padding: 4px; }
+.gsbtn {
+  background: transparent; border: none; border-radius: 999px; min-width: 40px; min-height: 40px; padding: 0;
+}
+.gsbtn.big { min-width: 52px; min-height: 44px; }
+.gsbtn:hover { background: rgba(255,255,255,0.12); }
+.gsbtn.on { background: #ffffff; }
+.gsclose { background: #000000; border: 1px solid rgba(255,255,255,0.22); min-width: 44px; min-height: 44px; }
+.gsgo {
+  background: transparent; border: 3px solid #ffffff; border-radius: 999px;
+  min-width: 64px; min-height: 64px; padding: 4px;
+}
+.gsgo-inner { background: #ffffff; border-radius: 999px; min-width: 50px; min-height: 50px; }
+.gsgo:hover .gsgo-inner { background: #dddddd; }
+.gsgo-inner.rec { background: #ffffff; min-width: 26px; min-height: 26px; border-radius: 6px; }
+
+/* ---------- overview (Super) */
+.ovbg { background: rgba(0, 0, 0, 0.62); font-family: "Hack Nerd Font Mono", monospace; color: #ffffff; }
+.ovsearch {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px;
+  min-height: 46px; padding: 0 20px; font-size: 15px;
+}
+.ovtile { background: rgba(0, 0, 0, 0.75); border: 1px solid rgba(255,255,255,0.35); border-radius: 20px; }
+.ovtile.active { border: 2px solid #ffffff; }
+.ovnum { color: #ffffff; font-weight: bold; font-size: 13px; margin: 8px 12px; }
+.ovwin { background: #0d0d0d; border: 1px solid #ffffff; border-radius: 10px; }
+.ovwin:hover { box-shadow: inset 0 0 0 2px #ffffff; }
+.ovapps { background: #000000; border: 1px solid #ffffff; border-radius: 26px; padding: 8px; }
+.ovapps row { color: #ffffff; border-radius: 999px; padding: 8px 14px; background: transparent; }
+.ovapps row:hover { box-shadow: inset 0 0 0 1px #ffffff; }
+.ovapps row:selected { background: #ffffff; color: #000000; }
+.ovmini {
+  background: #000000; border: 1px solid #ffffff; border-radius: 999px;
+  min-width: 46px; min-height: 46px; padding: 0;
+}
+.ovmini:hover { box-shadow: inset 0 0 0 2px #ffffff; }
+.ovsub { color: #ffffff; font-size: 12px; }
+.ovsep { background: #ffffff; min-width: 1px; margin: 8px 6px; }
+.traymenu { background: #000000; border: 1px solid #ffffff; border-radius: 18px; padding: 6px; }
+.traymenu button {
+  background: transparent; color: #ffffff; border: none; border-radius: 10px; min-height: 32px; padding: 0 12px;
+  font-family: "Hack Nerd Font Mono", monospace; font-size: 13px;
+}
+.traymenu button:hover { background: #ffffff; color: #000000; }
+.traymenu button:disabled { color: rgba(255,255,255,0.4); }
+.traymenu .msep { background: #ffffff; min-height: 1px; margin: 4px 8px; opacity: 0.3; }
+
+/* ---------- volume OSD */
+.osd {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px;
+  padding: 14px 22px; font-family: "Hack Nerd Font Mono", monospace; font-size: 14px; font-weight: bold;
+}
+.osdtrack { background: #000000; border: 1px solid #ffffff; border-radius: 999px; min-height: 8px; }
+.osdfill { background: #ffffff; border-radius: 999px; min-height: 8px; }
+"""
+
+
+# ------------------------------------------------------------------ helpers
+HYPR_SOCK = os.path.join(RUN, "hypr", os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""), ".socket.sock")
+
+
+def hypr(*args):
+    """запрос к Hyprland напрямую через его сокет: hyprctl из-под LD_PRELOAD грузит GTK, ~60 мс на вызов"""
+    args = list(args)
+    json_out = "-j" in args
+    if json_out:
+        args.remove("-j")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(3)
+            s.connect(HYPR_SOCK)
+            s.sendall((("j/" if json_out else "") + " ".join(args)).encode())
+            chunks = []
+            while True:
+                c = s.recv(65536)
+                if not c:
+                    break
+                chunks.append(c)
+        return b"".join(chunks).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def hypr_json(*args):
+    try:
+        return json.loads(hypr(*args, "-j"))
+    except json.JSONDecodeError:
+        return None
+
+
+CLEAN_ENV = {k: v for k, v in os.environ.items() if k != "LD_PRELOAD"}
+
+
+def spawn_shell(cmd):
+    # программы запускаются без LD_PRELOAD дока (он нужен только самому доку)
+    subprocess.Popen(["sh", "-c", cmd], start_new_session=True, env=CLEAN_ENV,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def notify(*args):
+    subprocess.Popen(["notify-send", *args], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def svg(path, size=24):
+    img = Gtk.Image.new_from_file(path)
+    img.set_pixel_size(size)
+    return img
+
+
+def lucide(name, dark=False, size=24):
+    return svg(os.path.join(ICONS, "black" if dark else "white", name + ".svg"), size)
+
+
+def brand(slug, dark=False, size=26):
+    return svg(os.path.join(ICONS, "brand", "black" if dark else "white", slug + ".svg"), size)
+
+
+def clear_box(box):
+    child = box.get_first_child()
+    while child:
+        nxt = child.get_next_sibling()
+        box.remove(child)
+        child = nxt
+
+
+def widget_y(w, ref):
+    """Y виджета внутри ref; translate_coordinates отдаёт (x, y) или None, в старых версиях (ok, x, y)."""
+    r = w.translate_coordinates(ref, 0, 0)
+    return float(r[-1]) if r else None
+
+
+def monitor_by_name(name):
+    mons = Gdk.Display.get_default().get_monitors()
+    for i in range(mons.get_n_items()):
+        m = mons.get_item(i)
+        if m.get_connector() == name:
+            return m
+    return mons.get_item(0) if mons.get_n_items() else None
+
+
+def load_pins():
+    try:
+        pins = json.load(open(PINNED))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pins = [dict(p) for p in DEFAULT_PINS]
+    # закреплённые по умолчанию: иконки, которые нравятся пользователю (не трогать)
+    by_cls = {p["class"].lower(): p for p in DEFAULT_PINS}
+    for p in pins:
+        d = by_cls.get(p.get("class", "").lower())
+        if d:
+            p["icon"] = d["icon"]
+    save_pins(pins)
+    return pins
+
+
+def save_pins(pins):
+    os.makedirs(os.path.dirname(PINNED), exist_ok=True)
+    json.dump(pins, open(PINNED, "w"), ensure_ascii=False, indent=2)
+
+
+def brand_for_class(cls):
+    c = (cls or "").lower()
+    parts = c.split(".")
+    for cand in (ALIASES.get(c), c, parts[-1], parts[-2] if len(parts) > 1 else None, c.replace(".", "-")):
+        if cand and os.path.exists(os.path.join(BRAND_ALL, cand + ".svg")):
+            return os.path.join(BRAND_ALL, cand + ".svg")
+    return None
+
+
+class Apps:
+    """Класс окна -> .desktop (название, команда запуска, цветная иконка на крайний случай)."""
+
+    def __init__(self):
+        self.by_key = {}
+        for a in Gio.AppInfo.get_all():
+            if not hasattr(a, "get_startup_wm_class"):
+                continue
+            keys = {(a.get_id() or "").removesuffix(".desktop").lower()}
+            wm = a.get_startup_wm_class()
+            if wm:
+                keys.add(wm.lower())
+            exe = a.get_executable()
+            if exe:
+                keys.add(os.path.basename(exe).lower())
+            for k in keys:
+                if k:
+                    self.by_key.setdefault(k, a)
+
+    def find(self, cls):
+        c = (cls or "").lower()
+        return self.by_key.get(c) or self.by_key.get(c.split(".")[-1])
+
+
+# ------------------------------------------------------------------ меню правого клика
+class MenuWindow(Gtk.ApplicationWindow):
+    """Меню у иконки дока. Не исчезает от движения мыши; закрывается после выбора, Esc или кликом по доку."""
+
+    def __init__(self, app):
+        super().__init__(application=app)
+        LS.init_for_window(self)
+        LS.set_namespace(self, "mono-menu")
+        LS.set_layer(self, LS.Layer.OVERLAY)
+        # весь монитор: прозрачная подложка ловит клик мимо меню и закрывает его
+        for e in (LS.Edge.LEFT, LS.Edge.RIGHT, LS.Edge.TOP, LS.Edge.BOTTOM):
+            LS.set_anchor(self, e, True)
+        LS.set_exclusive_zone(self, -1)
+        LS.set_keyboard_mode(self, LS.KeyboardMode.ON_DEMAND)
+        self.set_hide_on_close(True)
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda c, kv, kc, st: kv == Gdk.KEY_Escape and self.set_visible(False))
+        self.add_controller(keys)
+        catcher = Gtk.Fixed()
+        outside = Gtk.GestureClick(button=0)
+        outside.connect("pressed", self.on_outside)
+        catcher.add_controller(outside)
+        self.set_child(catcher)
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.box.add_css_class("menu")
+        self.box.set_size_request(210, -1)
+        catcher.put(self.box, 84, 100)
+        self.catcher = catcher
+
+    def on_outside(self, g, n, x, y):
+        a = self.box.get_allocation()
+        if not (a.x <= x <= a.x + a.width and a.y <= y <= a.y + a.height):
+            self.set_visible(False)
+
+    def open(self, mon, y, title, items):
+        clear_box(self.box)
+        t = Gtk.Label(label=title, xalign=0)
+        t.add_css_class("menutitle")
+        self.box.append(t)
+        for label, fn in items:
+            it = Gtk.Button(label=label)
+            it.add_css_class("menuitem")
+            it.get_child().set_xalign(0)
+            it.connect("clicked", lambda *_, f=fn: (self.set_visible(False), f()))
+            self.box.append(it)
+        if mon:
+            LS.set_monitor(self, mon)
+        self.catcher.move(self.box, 84, max(8, int(y)))
+        self.present()
+
+
+# ------------------------------------------------------------------ буфер обмена (как Clipboard Indicator)
+class ClipWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        LS.init_for_window(self)
+        LS.set_namespace(self, "mono-clip")
+        LS.set_layer(self, LS.Layer.OVERLAY)
+        for e in (LS.Edge.LEFT, LS.Edge.RIGHT, LS.Edge.TOP, LS.Edge.BOTTOM):
+            LS.set_anchor(self, e, True)
+        LS.set_exclusive_zone(self, -1)
+        LS.set_keyboard_mode(self, LS.KeyboardMode.ON_DEMAND)
+        self.set_hide_on_close(True)
+
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+
+        self.catcher = Gtk.Fixed()
+        outside = Gtk.GestureClick(button=0)
+        outside.connect("pressed", self.on_outside)
+        self.catcher.add_controller(outside)
+        self.set_child(self.catcher)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.add_css_class("clip")
+        box.set_size_request(400, -1)
+        self.box = box
+        self.catcher.put(box, 84, 100)
+
+        self.search = Gtk.SearchEntry(placeholder_text="поиск в истории")
+        self.search.connect("search-changed", lambda *_: self.fill())
+        self.search.connect("activate", lambda *_: self.copy_row(self.list.get_row_at_index(0)))
+        box.append(self.search)
+
+        self.scroll = Gtk.ScrolledWindow()
+        self.scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.scroll.set_min_content_height(420)
+        self.scroll.set_max_content_height(520)
+        self.scroll.set_propagate_natural_height(True)
+        self.list = Gtk.ListBox()
+        self.list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.list.set_activate_on_single_click(True)
+        self.list.connect("row-activated", lambda lb, row: self.copy_row(row))
+        self.scroll.set_child(self.list)
+        box.append(self.scroll)
+
+        clear = Gtk.Button(label="Очистить историю")
+        clear.add_css_class("clipclear")
+        clear.connect("clicked", lambda *_: (clip.clear(), self.fill()))
+        box.append(clear)
+
+    def on_outside(self, g, n, x, y):
+        a = self.box.get_allocation()
+        if not (a.x <= x <= a.x + a.width and a.y <= y <= a.y + a.height):
+            self.set_visible(False)
+
+    def on_key(self, ctrl, kv, kc, state):
+        if kv == Gdk.KEY_Escape:
+            self.set_visible(False)
+            return True
+        if kv == Gdk.KEY_Down and self.search.has_focus():
+            row = self.list.get_row_at_index(0)
+            if row:
+                self.list.select_row(row)
+                row.grab_focus()
+            return True
+        return False
+
+    def toggle(self, mon=None, y=None):
+        if self.get_visible():
+            self.set_visible(False)
+            return True
+        self.search.set_text("")
+        self.fill()
+        LS.set_monitor(self, mon or monitor_by_name(MAIN_OUTPUT))
+        top = max(8, int(y if y is not None else 300) - 40)
+        self.catcher.move(self.box, 84, min(top, 1080 - 620))
+        self.present()
+        self.search.grab_focus()
+        return True
+
+    def fill(self):
+        clear_box(self.list)
+        q = self.search.get_text().strip().lower()
+        n = 0
+        for name in clip.entries():
+            path = os.path.join(clip.DIR, name)
+            img = name.endswith(".png")
+            text = ""
+            if not img:
+                try:
+                    text = open(path, encoding="utf-8", errors="replace").read()
+                except OSError:
+                    continue
+            if q and (img or q not in text.lower()):
+                continue
+            self.list.append(self.row(name, path, img, text))
+            n += 1
+        if not n:
+            e = Gtk.Label(label="ничего не найдено" if q else "история пуста")
+            e.add_css_class("empty")
+            row = Gtk.ListBoxRow(selectable=False, activatable=False)
+            row.set_child(e)
+            self.list.append(row)
+
+    def row(self, name, path, img, text):
+        row = Gtk.ListBoxRow()
+        row.clip_name = name
+        h = Gtk.Box(spacing=8)
+        if img:
+            pic = Gtk.Picture.new_for_filename(path)
+            pic.set_content_fit(Gtk.ContentFit.COVER)
+            pic.set_can_shrink(True)
+            frame = Gtk.Box()  # одинаковое превью 64×40, лишнее обрезается
+            frame.set_size_request(64, 40)
+            frame.set_overflow(Gtk.Overflow.HIDDEN)
+            frame.add_css_class("clipthumb")
+            pic.set_hexpand(True)
+            frame.append(pic)
+            h.append(frame)
+            lab = Gtk.Label(label=clip.preview(name).split("  ")[0].strip("[]"), xalign=0, hexpand=True)
+        else:
+            one = " ".join(text.split())
+            lab = Gtk.Label(label=one, xalign=0, hexpand=True, ellipsize=3, max_width_chars=34)
+            lab.add_css_class("cliptext")
+        h.append(lab)
+        d = Gtk.Button(label="×")
+        d.add_css_class("clipdel")
+        d.connect("clicked", lambda *_: self.delete(name))
+        h.append(d)
+        row.set_child(h)
+        return row
+
+    def copy_row(self, row):
+        name = getattr(row, "clip_name", None) if row else None
+        if not name:
+            return
+        path = os.path.join(clip.DIR, name)
+        cmd = ["wl-copy"] + (["--type", "image/png"] if name.endswith(".png") else [])
+        with open(path, "rb") as f:
+            subprocess.Popen(cmd, stdin=f, start_new_session=True)
+        os.utime(path)
+        self.set_visible(False)
+
+    def delete(self, name):
+        try:
+            os.remove(os.path.join(clip.DIR, name))
+        except FileNotFoundError:
+            pass
+        self.fill()
+
+
+# ------------------------------------------------------------------ снимок и запись (как в GNOME)
+def user_dir(kind, sub, fallback):
+    try:
+        base = subprocess.run(["xdg-user-dir", kind], capture_output=True, text=True).stdout.strip()
+    except OSError:
+        base = ""
+    d = os.path.join(base or os.path.join(HOME, fallback), sub)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def recording_pid():
+    try:
+        pid = int(open(REC_PID).read())
+        os.kill(pid, 0)
+        return pid
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        return None
+
+
+def stop_recording():
+    pid = recording_pid()
+    if pid:
+        os.kill(pid, signal.SIGINT)
+
+
+def rounded(cr, x, y, w, h, r):
+    r = max(0, min(r, w / 2, h / 2))
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    cr.close_path()
+
+
+def rgba(spec):
+    c = Gdk.RGBA()
+    c.parse(spec)
+    return c
+
+
+DIM, WHITE, BLACK = rgba("rgba(0,0,0,0.55)"), rgba("#ffffff"), rgba("#000000")
+
+
+class SelLayer(Gtk.Widget):
+    """Затемнение с вырезом под область, рамка и ручки по углам (как в GNOME). Рисует видеокарта."""
+
+    __gtype_name__ = "MonoSelLayer"
+    HANDLE = 7
+
+    def __init__(self):
+        super().__init__(hexpand=True, vexpand=True)
+        self.sel = None
+        self.hover = None    # подсвеченное окно в режиме «Окно»
+        self.handles = True
+
+    def rect(self, x, y, w, h):
+        return Graphene.Rect().init(x, y, max(0, w), max(0, h))
+
+    def rr(self, x, y, w, h, r):
+        z = Gsk.RoundedRect()
+        z.init_from_rect(self.rect(x, y, w, h), r)
+        return z
+
+    def do_snapshot(self, sn):
+        W, H = self.get_width(), self.get_height()
+        box = self.hover or self.sel
+        if not box:
+            sn.append_color(DIM, self.rect(0, 0, W, H))
+            return
+        x, y, w, h = box
+        sn.append_color(DIM, self.rect(0, 0, W, y))
+        sn.append_color(DIM, self.rect(0, y + h, W, H - y - h))
+        sn.append_color(DIM, self.rect(0, y, x, h))
+        sn.append_color(DIM, self.rect(x + w, y, W - x - w, h))
+        sn.append_border(self.rr(x, y, w, h, 0), [2, 2, 2, 2], [WHITE] * 4)
+        if self.handles and not self.hover:
+            r = self.HANDLE
+            for cx, cy in ((x, y), (x + w, y), (x, y + h), (x + w, y + h)):
+                sn.push_rounded_clip(self.rr(cx - r, cy - r, 2 * r, 2 * r, r))
+                sn.append_color(WHITE, self.rect(cx - r, cy - r, 2 * r, 2 * r))
+                sn.pop()
+
+
+class ShotOverlay(Gtk.ApplicationWindow):
+    """Скриншотер как в GNOME: экран замирает, режимы Выделение / Экран / Окно, Фото / Видео, курсор.
+    Пробел или Enter: снять, Esc: отмена. Выделение запоминается между вызовами."""
+
+    def __init__(self, app):
+        super().__init__(application=app)
+        LS.init_for_window(self)
+        LS.set_namespace(self, "mono-shot")
+        LS.set_layer(self, LS.Layer.OVERLAY)
+        for e in (LS.Edge.LEFT, LS.Edge.RIGHT, LS.Edge.TOP, LS.Edge.BOTTOM):
+            LS.set_anchor(self, e, True)
+        LS.set_exclusive_zone(self, -1)
+        LS.set_keyboard_mode(self, LS.KeyboardMode.EXCLUSIVE)
+        self.set_hide_on_close(True)
+
+        self.mode = "shot"      # shot | video
+        self.target = "area"    # area | screen | window
+        self.cursor = False
+        self.sel = None
+        self.last_sel = {}      # монитор -> последняя область
+        self.mon = None
+        self.frozen = {}
+        self.wins = []
+        self.drag = None
+
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+
+        ov = Gtk.Overlay()
+        self.set_child(ov)
+        self.pic = Gtk.Picture()
+        self.pic.set_content_fit(Gtk.ContentFit.FILL)
+        self.pic.set_can_shrink(True)
+        ov.set_child(self.pic)
+
+        self.area = SelLayer()
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self.drag_begin)
+        drag.connect("drag-update", self.drag_update)
+        drag.connect("drag-end", self.drag_end)
+        self.area.add_controller(drag)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self.on_motion)
+        self.area.add_controller(motion)
+        ov.add_overlay(self.area)
+
+        # панель снизу, как в GNOME: [курсор] [выделение экран окно] (снять) [фото видео]
+        bar = Gtk.Box(spacing=14)
+        bar.add_css_class("gsbar")
+        bar.set_halign(Gtk.Align.CENTER)
+        bar.set_valign(Gtk.Align.END)
+        bar.set_margin_bottom(40)
+        ov.add_overlay(bar)
+
+        self.b_cursor = self.ibtn("mouse-pointer-2", self.flip_cursor, "показать курсор")
+        bar.append(self.b_cursor)
+        grp = Gtk.Box(spacing=4)
+        grp.add_css_class("gsgroup")
+        self.b_target = {}
+        for key, ic, tip in (("area", "scan", "выделение"), ("screen", "monitor", "экран"),
+                             ("window", "app-window", "окно")):
+            b = self.ibtn(ic, lambda k=key: self.set_target(k), tip, big=True)
+            self.b_target[key] = b
+            grp.append(b)
+        bar.append(grp)
+        self.go = Gtk.Button()
+        self.go.set_focusable(False)
+        self.go.add_css_class("gsgo")
+        self.go.set_tooltip_text("снять · пробел")
+        inner = Gtk.Box()
+        inner.add_css_class("gsgo-inner")
+        inner.set_halign(Gtk.Align.CENTER)
+        inner.set_valign(Gtk.Align.CENTER)
+        self.go.set_child(inner)
+        self.go_inner = inner
+        self.go.connect("clicked", lambda *_: self.capture())
+        bar.append(self.go)
+        grp2 = Gtk.Box(spacing=4)
+        grp2.add_css_class("gsgroup")
+        self.b_shot = self.ibtn("camera", lambda: self.set_mode("shot"), "снимок")
+        self.b_video = self.ibtn("video", lambda: self.set_mode("video"), "видео")
+        grp2.append(self.b_shot)
+        grp2.append(self.b_video)
+        bar.append(grp2)
+
+        close = self.ibtn("x", self.cancel, "закрыть · esc")
+        close.add_css_class("gsclose")
+        close.set_halign(Gtk.Align.END)
+        close.set_valign(Gtk.Align.END)
+        close.set_margin_bottom(150)
+        close.set_margin_end(40)
+        ov.add_overlay(close)
+        self.sync()
+
+    def ibtn(self, ic, fn, tip, big=False):
+        b = Gtk.Button()
+        b.set_focusable(False)
+        b.add_css_class("gsbtn")
+        if big:
+            b.add_css_class("big")
+        b.ic = ic
+        b.img = lucide(ic, size=20)
+        b.set_child(b.img)
+        b.set_tooltip_text(tip)
+        b.connect("clicked", lambda *_: fn())
+        return b
+
+    def mark(self, b, on):
+        (b.add_css_class if on else b.remove_css_class)("on")
+        b.img.set_from_file(os.path.join(ICONS, "black" if on else "white", b.ic + ".svg"))
+
+    def sync(self):
+        for k, b in self.b_target.items():
+            self.mark(b, k == self.target)
+        self.mark(self.b_shot, self.mode == "shot")
+        self.mark(self.b_video, self.mode == "video")
+        self.mark(self.b_cursor, self.cursor)
+        (self.go_inner.add_css_class if self.mode == "video" else self.go_inner.remove_css_class)("rec")
+        if self.frozen:
+            self.pic.set_filename(self.frozen.get(self.cursor))
+        self.area.handles = self.target == "area"
+        self.area.queue_draw()
+
+    def set_mode(self, m):
+        self.mode = m
+        self.sync()
+
+    def set_target(self, k):
+        self.target = k
+        self.area.hover = None
+        if k == "screen":
+            self.sel = (0, 0, self.area.get_width(), self.area.get_height())
+        elif k == "area":
+            self.sel = self.last_sel.get(self.mon["name"]) if self.mon else None
+        else:
+            self.sel = None
+        self.area.sel = self.sel
+        self.sync()
+
+    def flip_cursor(self):
+        self.cursor = not self.cursor
+        self.sync()
+
+    # ---------- открыть / закрыть
+    def toggle(self):
+        if recording_pid():  # то же сочетание во время записи = стоп
+            stop_recording()
+            return True
+        if self.get_visible():
+            self.cancel()
+            return True
+        mon = next((m for m in (hypr_json("monitors") or []) if m.get("focused")), None)
+        if not mon:
+            return True
+        self.mon = mon
+        a = os.path.join(RUN, "mono-frozen.png")
+        b = os.path.join(RUN, "mono-frozen-cursor.png")
+        # оба кадра одновременно и без сжатия PNG: так оверлей появляется почти сразу
+        p1 = subprocess.Popen(["grim", "-l", "0", "-o", mon["name"], a])
+        p2 = subprocess.Popen(["grim", "-l", "0", "-c", "-o", mon["name"], b])
+        p1.wait()
+        p2.wait()
+        self.frozen = {False: a, True: b}
+        # окна на этом мониторе, для режима «Окно» (координаты относительно монитора)
+        ws = mon["activeWorkspace"]["id"]
+        self.wins = [(c["at"][0] - mon["x"], c["at"][1] - mon["y"], c["size"][0], c["size"][1])
+                     for c in sorted(hypr_json("clients") or [], key=lambda c: c.get("focusHistoryID", 0))
+                     if c["workspace"]["id"] == ws]
+        self.target = "area" if self.target == "screen" else self.target
+        self.sel = self.last_sel.get(mon["name"]) if self.target == "area" else None
+        self.area.sel = self.sel
+        self.area.hover = None
+        LS.set_monitor(self, monitor_by_name(mon["name"]))
+        self.sync()
+        self.present()
+        return True
+
+    def cancel(self):
+        self.set_visible(False)
+
+    def on_key(self, ctrl, kv, kc, state):
+        if kv == Gdk.KEY_Escape:
+            self.cancel()
+            return True
+        if kv in (Gdk.KEY_space, Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self.capture()
+            return True
+        return False
+
+    # ---------- мышь
+    def on_motion(self, ctl, x, y):
+        if self.target != "window" or self.drag:
+            return
+        hit = next(((wx, wy, ww, wh) for wx, wy, ww, wh in self.wins
+                    if wx <= x <= wx + ww and wy <= y <= wy + wh), None)
+        if hit != self.area.hover:
+            self.area.hover = hit
+            self.area.queue_draw()
+
+    def drag_begin(self, g, x, y):
+        if self.target == "window":
+            if self.area.hover:
+                self.sel = self.area.hover
+                self.area.sel = self.sel
+                self.area.hover = None
+                self.capture()
+            return
+        if self.target == "screen":
+            return
+        r = SelLayer.HANDLE + 6
+        if self.sel:
+            sx, sy, sw, sh = self.sel
+            corners = {"tl": (sx, sy), "tr": (sx + sw, sy), "bl": (sx, sy + sh), "br": (sx + sw, sy + sh)}
+            for name, (cx, cy) in corners.items():
+                if abs(x - cx) <= r and abs(y - cy) <= r:
+                    self.drag = ("resize", name, self.sel)
+                    return
+            if sx <= x <= sx + sw and sy <= y <= sy + sh:
+                self.drag = ("move", None, self.sel)
+                return
+        self.drag = ("new", (x, y), None)
+
+    def drag_update(self, g, dx, dy):
+        if not self.drag:
+            return
+        kind, info, orig = self.drag
+        W, H = self.area.get_width(), self.area.get_height()
+        if kind == "new":
+            x0, y0 = info
+            x, y, w, h = min(x0, x0 + dx), min(y0, y0 + dy), abs(dx), abs(dy)
+        elif kind == "move":
+            sx, sy, w, h = orig
+            x, y = max(0, min(W - w, sx + dx)), max(0, min(H - h, sy + dy))
+        else:
+            sx, sy, sw, sh = orig
+            x1, y1, x2, y2 = sx, sy, sx + sw, sy + sh
+            if "l" in info:
+                x1 += dx
+            else:
+                x2 += dx
+            if "t" in info:
+                y1 += dy
+            else:
+                y2 += dy
+            x, y, w, h = min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1)
+        self.sel = (x, y, w, h) if w > 4 and h > 4 else None
+        self.area.sel = self.sel
+        self.area.queue_draw()
+
+    def drag_end(self, g, dx, dy):
+        self.drag = None
+        if self.sel and self.target == "area" and self.mon:
+            self.last_sel[self.mon["name"]] = self.sel
+
+    # ---------- снять
+    def capture(self):
+        mon = self.mon
+        if not mon:
+            return
+        aw, ah = self.area.get_width(), self.area.get_height()
+        sel = self.sel or (0, 0, aw, ah)
+        mode, cursor = self.mode, self.cursor
+        self.set_visible(False)
+        stamp = GLib.DateTime.new_now_local().format("%Y-%m-%d_%H-%M-%S")
+        if mode == "shot":
+            src = GdkPixbuf.Pixbuf.new_from_file(self.frozen[cursor])
+            k = src.get_width() / max(1, aw)
+            x, y = int(sel[0] * k), int(sel[1] * k)
+            w = max(1, min(int(sel[2] * k), src.get_width() - x))
+            h = max(1, min(int(sel[3] * k), src.get_height() - y))
+            path = os.path.join(user_dir("PICTURES", "Screenshots", "Pictures"), stamp + ".png")
+            src.new_subpixbuf(x, y, w, h).savev(path, "png", [], [])
+            with open(path, "rb") as f:
+                subprocess.Popen(["wl-copy", "--type", "image/png"], stdin=f, start_new_session=True)
+            notify("-i", path, "Снимок экрана", "в буфере и в папке Screenshots")
+            return
+        if not shutil.which("wf-recorder"):
+            notify("Запись экрана", "не установлен wf-recorder")
+            return
+        # координаты в общей раскладке мониторов; размеры чётные (так требует кодек)
+        gx, gy = int(mon["x"] + sel[0]), int(mon["y"] + sel[1])
+        gw, gh = int(sel[2]) // 2 * 2, int(sel[3]) // 2 * 2
+        path = os.path.join(user_dir("VIDEOS", "Screencasts", "Videos"), stamp + ".webm")
+        log = open(os.path.join(HOME, ".cache", "mono-rec.log"), "w")
+        # VP8 в реальном времени: аппаратного кодировщика в ffmpeg Fedora нет, VP9 для Athlon слишком тяжёл
+        cmd = ["wf-recorder", "-y", "-c", "libvpx", "-p", "deadline=realtime", "-p", "cpu-used=8",
+               "-g", f"{gx},{gy} {gw}x{gh}", "-f", path]
+
+        def start():
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+            open(REC_PID, "w").write(str(proc.pid))
+            notify("Запись экрана", "идёт запись · стоп: Ctrl+Shift+S или белый квадрат в доке")
+            threading.Thread(target=self.wait_rec, args=(proc, path), daemon=True).start()
+            return False
+
+        GLib.timeout_add(250, start)  # дать оверлею исчезнуть
+
+    def wait_rec(self, proc, path):
+        proc.wait()
+        try:
+            os.remove(REC_PID)
+        except FileNotFoundError:
+            pass
+        notify("Запись сохранена", path)
+
+
+# ------------------------------------------------------------------ обзор окон (Super, как в GNOME)
+class OverviewWindow(Gtk.ApplicationWindow):
+    """Обзор как в illogical-impulse: поиск приложений сверху, под ним сетка 10 столов с окнами.
+    Клик по окну: фокус. Клик по столу: перейти. Окно можно перетащить на другой стол."""
+
+    TILE_W = 300
+
+    def __init__(self, app, dock_ref):
+        super().__init__(application=app)
+        self.dock_ref = dock_ref
+        LS.init_for_window(self)
+        LS.set_namespace(self, "mono-overview")
+        LS.set_layer(self, LS.Layer.OVERLAY)
+        for e in (LS.Edge.LEFT, LS.Edge.RIGHT, LS.Edge.TOP, LS.Edge.BOTTOM):
+            LS.set_anchor(self, e, True)
+        LS.set_exclusive_zone(self, -1)
+        LS.set_keyboard_mode(self, LS.KeyboardMode.EXCLUSIVE)
+        self.set_hide_on_close(True)
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+
+        bg = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=22)
+        bg.add_css_class("ovbg")
+        outside = Gtk.GestureClick(button=1)
+        outside.connect("released", self.on_bg_click)
+        bg.add_controller(outside)
+        self.set_child(bg)
+
+        self.search = Gtk.SearchEntry(placeholder_text="поиск приложений")
+        self.search.add_css_class("ovsearch")
+        self.search.set_halign(Gtk.Align.CENTER)
+        self.search.set_size_request(560, -1)
+        self.search.set_margin_top(48)
+        self.search.connect("search-changed", lambda *_: self.on_search())
+        self.search.connect("activate", lambda *_: self.launch_first())
+        bg.append(self.search)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_vexpand(True)
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        bg.append(self.stack)
+
+        self.grid = Gtk.Grid(column_spacing=18, row_spacing=18)
+        self.grid.set_halign(Gtk.Align.CENTER)
+        self.grid.set_valign(Gtk.Align.START)
+        self.stack.add_named(self.grid, "ws")
+
+        self.apps_box = Gtk.ListBox()
+        self.apps_box.add_css_class("ovapps")
+        self.apps_box.set_halign(Gtk.Align.CENTER)
+        self.apps_box.set_valign(Gtk.Align.START)
+        self.apps_box.set_size_request(560, -1)
+        self.apps_box.set_activate_on_single_click(True)
+        self.apps_box.connect("row-activated", lambda lb, row: self.launch(row.app))
+        self.stack.add_named(self.apps_box, "apps")
+
+        self.tray = None  # служба трея: значки фоновых приложений внизу
+        self.hidden_row = Gtk.Box(spacing=12)
+        self.hidden_row.set_halign(Gtk.Align.CENTER)
+        self.hidden_row.set_margin_bottom(36)
+        bg.append(self.hidden_row)
+
+    # ---------- открыть / закрыть
+    def on_key(self, ctrl, kv, kc, state):
+        if kv == Gdk.KEY_Escape:
+            self.set_visible(False)
+            return True
+        # Super не обрабатываем: закрывает отпускание Super через бинд Hyprland (иначе откроется снова)
+        if kv == Gdk.KEY_Down and self.stack.get_visible_child_name() == "apps":
+            row = self.apps_box.get_row_at_index(0)
+            if row:
+                self.apps_box.select_row(row)
+                row.grab_focus()
+            return True
+        return False
+
+    def on_bg_click(self, g, n, x, y):
+        t = self.pick(x, y, Gtk.PickFlags.DEFAULT)
+        while t is not None and not getattr(t, "is_target", False) and t is not self.search:
+            t = t.get_parent()
+        if t is None:
+            self.set_visible(False)
+
+    def toggle(self):
+        if self.get_visible():
+            self.set_visible(False)
+            return True
+        self.mons = hypr_json("monitors") or []
+        self.rules = {}
+        for w in hypr_json("workspacerules") or []:
+            try:
+                self.rules[int(w.get("workspaceString", "0"))] = w.get("monitor", "")
+            except ValueError:
+                pass
+        focused = next((m for m in self.mons if m.get("focused")), self.mons[0] if self.mons else None)
+        # сначала показать сразу (с иконками), живые миниатюры дорисовать в фоне
+        self.shots = {}
+        self.build()
+        threading.Thread(target=self.grab_shots, daemon=True).start()
+        self.search.set_text("")
+        self.stack.set_visible_child_name("ws")
+        if focused:
+            LS.set_monitor(self, monitor_by_name(focused["name"]))
+        self.present()
+        self.search.grab_focus()
+        return True
+
+    def grab_shots(self):
+        shots, procs = {}, []
+        for m in self.mons:
+            path = os.path.join(RUN, f"mono-ov-{m['name']}.ppm")
+            procs.append((m, path, subprocess.Popen(["grim", "-t", "ppm", "-o", m["name"], path])))
+        for m, path, pr in procs:
+            pr.wait()
+            try:
+                shots[m["activeWorkspace"]["id"]] = (m, GdkPixbuf.Pixbuf.new_from_file(path))
+            except GLib.Error:
+                pass
+        GLib.idle_add(self.apply_shots, shots)
+
+    def apply_shots(self, shots):
+        if self.get_visible():
+            self.shots = shots
+            self.build()
+        return False
+
+    # ---------- сетка столов
+    def ws_monitor(self, wid):
+        mon = self.rules.get(wid, "")
+        for m in self.mons:
+            if m["name"] == mon or ("desc:" in mon and mon.split("desc:", 1)[1] in m.get("description", "")):
+                return m
+        for m in self.mons:
+            if m["activeWorkspace"]["id"] == wid:
+                return m
+        return self.mons[0] if self.mons else {"x": 0, "y": 0, "width": 1920, "height": 1080, "name": ""}
+
+    def build(self):
+        clear_box(self.grid)
+        clear_box(self.hidden_row)
+        clients = [c for c in (hypr_json("clients") or []) if c.get("mapped", True) and c.get("class")]
+        active = {m["activeWorkspace"]["id"] for m in self.mons}
+        for i, wid in enumerate(range(1, 11)):
+            m = self.ws_monitor(wid)
+            wins = [c for c in clients if c["workspace"]["id"] == wid]
+            self.grid.attach(self.tile(wid, m, wins, wid in active), i % 5, i // 5, 1, 1)
+        hidden = [c for c in clients if c["workspace"]["name"] == HIDE]
+        if hidden:
+            lab = Gtk.Label(label="свёрнутые")
+            lab.add_css_class("ovsub")
+            self.hidden_row.append(lab)
+            for c in hidden:
+                b = Gtk.Button()
+                b.add_css_class("ovmini")
+                b.is_target = True
+                b.set_child(self.icon(c, 28))
+                b.set_tooltip_text(c.get("title") or c["class"])
+                b.connect("clicked", lambda _b, a=c["address"]: self.go_window(a, True))
+                self.hidden_row.append(b)
+        self.build_tray()
+
+    # ---------- трей: фоновые приложения (Telegram, Discord...)
+    def tray_changed(self):
+        if self.get_visible():
+            self.build()
+
+    def build_tray(self):
+        items = self.tray.visible() if self.tray else []
+        if not items:
+            return
+        if self.hidden_row.get_first_child():
+            sep = Gtk.Box()
+            sep.add_css_class("ovsep")
+            self.hidden_row.append(sep)
+        lab = Gtk.Label(label="в фоне")
+        lab.add_css_class("ovsub")
+        self.hidden_row.append(lab)
+        for it in items:
+            b = Gtk.Button()
+            b.add_css_class("ovmini")
+            b.is_target = True
+            b.set_child(self.tray_icon(it))
+            b.set_tooltip_text(it.title())
+            b.connect("clicked", lambda _b, it=it: (self.set_visible(False), self.tray.activate(it)))
+            right = Gtk.GestureClick(button=3)
+            right.connect("pressed", lambda *_a, it=it, b=b: self.tray_menu(it, b))
+            b.add_controller(right)
+            self.hidden_row.append(b)
+
+    def tray_icon(self, it):
+        for name in (it.get("Id"), it.get("Title"), it.get("IconName")):
+            p = brand_for_class((name or "").lower().replace("desktop", "").strip())
+            if p:
+                return svg(p, 26)
+        pb = it.pixbuf(28)
+        if pb:
+            img = Gtk.Image.new_from_paintable(Gdk.Texture.new_for_pixbuf(pb))
+            img.set_pixel_size(28)
+            img.add_css_class("appicon-color")
+            return img
+        return lucide("app-window")
+
+    def tray_menu(self, it, anchor):
+        if not it.get("Menu"):
+            self.tray.secondary(it)
+            return
+
+        def show(entries):
+            pop = Gtk.Popover()
+            pop.set_has_arrow(False)
+            pop.set_parent(anchor)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            box.add_css_class("traymenu")
+
+            def add(items, depth):
+                for e in items:
+                    if e["separator"]:
+                        sep = Gtk.Box()
+                        sep.add_css_class("msep")
+                        box.append(sep)
+                        continue
+                    mark = ("● " if e["checked"] else "○ ") if e["toggle"] else ""
+                    lab = Gtk.Label(label="   " * depth + mark + e["label"], xalign=0)
+                    btn = Gtk.Button(child=lab)
+                    btn.set_sensitive(bool(e["enabled"]) and not e["children"])
+                    btn.connect("clicked", lambda _b, i=e["id"]: (pop.popdown(), self.set_visible(False),
+                                                                   self.tray.click(it, i)))
+                    box.append(btn)
+                    add(e["children"], depth + 1)
+            add(entries, 0)
+            pop.set_child(box)
+            pop.connect("closed", lambda p: GLib.idle_add(p.unparent))
+            pop.popup()
+        self.tray.menu(it, show)
+
+    def icon(self, c, size):
+        img = self.dock_ref.icon_for({"icon": "auto", "class": c["class"]})
+        if isinstance(img, Gtk.Image):
+            img.set_pixel_size(size)
+        return img
+
+    def tile(self, wid, m, wins, is_active):
+        TW = self.TILE_W
+        TH = int(TW * m["height"] / max(1, m["width"]))
+        k = TW / max(1, m["width"])
+        frame = Gtk.Overlay()
+        frame.is_target = True
+        frame.add_css_class("ovtile")
+        if is_active:
+            frame.add_css_class("active")
+        frame.set_size_request(TW, TH)
+        frame.set_overflow(Gtk.Overflow.HIDDEN)
+        base = Gtk.Box()
+        base.set_size_request(TW, TH)
+        frame.set_child(base)
+        num = Gtk.Label(label=str(wid))
+        num.add_css_class("ovnum")
+        num.set_halign(Gtk.Align.START)
+        num.set_valign(Gtk.Align.START)
+        num.set_can_target(False)
+        frame.add_overlay(num)
+        canvas = Gtk.Fixed()
+        frame.add_overlay(canvas)
+        for c in sorted(wins, key=lambda c: -c.get("focusHistoryID", 0)):
+            x, y = (c["at"][0] - m["x"]) * k, (c["at"][1] - m["y"]) * k
+            w, h = max(24, c["size"][0] * k), max(18, c["size"][1] * k)
+            canvas.put(self.win_widget(c, m, w, h), max(0, x), max(0, y))
+        # клик по пустому месту стола = перейти на него
+        canvas_click = Gtk.GestureClick(button=1)
+        canvas_click.connect("released", lambda g, n, x, y, w=wid: self.go_ws_if_empty(canvas, x, y, w))
+        canvas.add_controller(canvas_click)
+        # сюда можно бросить окно с другого стола
+        drop = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+        drop.connect("drop", lambda t, val, x, y, w=wid: self.move_to(val, w))
+        frame.add_controller(drop)
+        return frame
+
+    def win_widget(self, c, m, w, h):
+        box = Gtk.Overlay()
+        box.is_target = True
+        box.add_css_class("ovwin")
+        box.set_size_request(int(w), int(h))
+        box.set_overflow(Gtk.Overflow.HIDDEN)
+        shot = self.shots.get(c["workspace"]["id"])
+        pic = None
+        if shot and c["workspace"]["name"] != HIDE:
+            mm, pb = shot
+            x, y = max(0, c["at"][0] - mm["x"]), max(0, c["at"][1] - mm["y"])
+            cw, ch = min(c["size"][0], pb.get_width() - x), min(c["size"][1], pb.get_height() - y)
+            if cw > 10 and ch > 10:
+                sub = pb.new_subpixbuf(x, y, cw, ch).scale_simple(max(1, int(w)), max(1, int(h)),
+                                                                  GdkPixbuf.InterpType.BILINEAR)
+                pic = Gtk.Picture.new_for_pixbuf(sub)
+                pic.set_content_fit(Gtk.ContentFit.FILL)
+        if pic is None:
+            pic = Gtk.CenterBox()
+            pic.set_center_widget(self.icon(c, int(min(36, max(14, min(w, h) * 0.45)))))
+        box.set_child(pic)
+        box.set_tooltip_text(c.get("title") or c["class"])
+        click = Gtk.GestureClick(button=1)
+        click.connect("released", lambda g, n, x, y, a=c["address"]: self.go_window(a, False))
+        box.add_controller(click)
+        drag = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+        drag.connect("prepare", lambda s, x, y, a=c["address"]: Gdk.ContentProvider.new_for_value(a))
+        drag.connect("drag-begin", lambda s, d, wdg=box: s.set_icon(Gtk.WidgetPaintable.new(wdg), 10, 10))
+        box.add_controller(drag)
+        return box
+
+    def go_ws_if_empty(self, canvas, x, y, wid):
+        t = canvas.pick(x, y, Gtk.PickFlags.DEFAULT)
+        if t is canvas or t is None:
+            self.go_ws(wid)
+
+    def go_ws(self, wid):
+        self.set_visible(False)
+        hypr("dispatch", "workspace", str(wid))
+
+    def go_window(self, addr, hidden):
+        self.set_visible(False)
+        if hidden:
+            spawn_shell(f"{HOME}/.local/bin/mono-minimize flip {addr}")
+        else:
+            hypr("dispatch", "focuswindow", f"address:{addr}")
+
+    def move_to(self, addr, wid):
+        hypr("dispatch", "movetoworkspacesilent", f"{wid},address:{addr}")
+        GLib.timeout_add(120, lambda: (self.build(), False)[1])
+        return True
+
+    # ---------- поиск приложений
+    def on_search(self):
+        q = self.search.get_text().strip().lower()
+        if not q:
+            self.stack.set_visible_child_name("ws")
+            return
+        clear_box(self.apps_box)
+        found = []
+        for a in Gio.AppInfo.get_all():
+            if not a.should_show():
+                continue
+            hay = " ".join(filter(None, [a.get_display_name(), a.get_name(), a.get_executable() or "",
+                                         " ".join(getattr(a, "get_keywords", lambda: [])() or [])])).lower()
+            if q in hay:
+                found.append(a)
+        found.sort(key=lambda a: (not a.get_display_name().lower().startswith(q), a.get_display_name().lower()))
+        for a in found[:8]:
+            row = Gtk.ListBoxRow()
+            row.app = a
+            h = Gtk.Box(spacing=14)
+            ic = Gtk.Image.new_from_gicon(a.get_icon()) if a.get_icon() else lucide("app-window")
+            ic.set_pixel_size(28)
+            ic.add_css_class("appicon-color")
+            h.append(ic)
+            h.append(Gtk.Label(label=a.get_display_name(), xalign=0))
+            row.set_child(h)
+            self.apps_box.append(row)
+        if not found:
+            row = Gtk.ListBoxRow(activatable=False, selectable=False)
+            row.set_child(Gtk.Label(label="ничего не найдено"))
+            self.apps_box.append(row)
+        self.stack.set_visible_child_name("apps")
+
+    def launch_first(self):
+        row = self.apps_box.get_row_at_index(0)
+        if self.stack.get_visible_child_name() == "apps" and row is not None and hasattr(row, "app"):
+            self.launch(row.app)
+
+    def launch(self, app):
+        self.set_visible(False)
+        app_id = (app.get_id() or "").removesuffix(".desktop")
+        spawn_shell(f"gtk-launch {shlex.quote(app_id)}")
+
+
+# ------------------------------------------------------------------ индикатор громкости
+class OsdWindow(Gtk.ApplicationWindow):
+    W = 220
+
+    def __init__(self, app):
+        super().__init__(application=app)
+        LS.init_for_window(self)
+        LS.set_namespace(self, "mono-osd")
+        LS.set_layer(self, LS.Layer.OVERLAY)
+        LS.set_anchor(self, LS.Edge.BOTTOM, True)
+        LS.set_margin(self, LS.Edge.BOTTOM, 110)
+        LS.set_keyboard_mode(self, LS.KeyboardMode.NONE)
+        self.set_can_target(False)
+        row = Gtk.Box(spacing=14)
+        row.add_css_class("osd")
+        self.set_child(row)
+        self.img = lucide("volume-2", size=22)
+        row.append(self.img)
+        track = Gtk.Overlay()
+        bg = Gtk.Box()
+        bg.add_css_class("osdtrack")
+        bg.set_size_request(self.W, 8)
+        bg.set_valign(Gtk.Align.CENTER)
+        track.set_child(bg)
+        self.fill = Gtk.Box()
+        self.fill.add_css_class("osdfill")
+        self.fill.set_halign(Gtk.Align.START)
+        self.fill.set_valign(Gtk.Align.CENTER)
+        track.add_overlay(self.fill)
+        row.append(track)
+        self.pct = Gtk.Label(label="0")
+        self.pct.set_width_chars(4)
+        self.pct.set_xalign(1)
+        row.append(self.pct)
+        self.hide_id = 0
+
+    def poke(self):
+        def read():
+            r = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], capture_output=True, text=True)
+            try:
+                return float(r.stdout.split()[1]), "MUTED" in r.stdout
+            except (IndexError, ValueError):
+                return 0.0, False
+
+        threading.Thread(target=lambda: GLib.idle_add(self.show_level, *read()), daemon=True).start()
+        return True
+
+    def show_level(self, vol, muted):
+        v = 0 if muted else max(0.0, min(vol, 1.0))
+        self.img.set_from_file(os.path.join(ICONS, "white", ("volume-x" if muted else "volume-2") + ".svg"))
+        self.fill.set_size_request(max(8, round(self.W * v)) if v > 0 else 0, 8)
+        self.fill.set_visible(v > 0)
+        self.pct.set_label("выкл" if muted else f"{round(vol * 100)}%")
+        LS.set_monitor(self, monitor_by_name(MAIN_OUTPUT))
+        self.present()
+        if self.hide_id:
+            GLib.source_remove(self.hide_id)
+        self.hide_id = GLib.timeout_add(1500, self.fade)
+        return False
+
+    def fade(self):
+        self.hide_id = 0
+        self.set_visible(False)
+        return False
+
+
+# ------------------------------------------------------------------ док
+class Dock(Gtk.ApplicationWindow):
+    def __init__(self, app, clipwin, menuwin):
+        super().__init__(application=app)
+        self.clipwin = clipwin
+        self.menuwin = menuwin
+        LS.init_for_window(self)
+        LS.set_namespace(self, "mono-dock")
+        LS.set_layer(self, LS.Layer.TOP)
+        for e in (LS.Edge.LEFT, LS.Edge.TOP, LS.Edge.BOTTOM):
+            LS.set_anchor(self, e, True)
+        LS.auto_exclusive_zone_enable(self)
+        self.mon = monitor_by_name(MAIN_OUTPUT)
+        if self.mon:
+            LS.set_monitor(self, self.mon)
+
+        self.apps = Apps()
+        self.pins = load_pins()
+
+        root = Gtk.CenterBox(orientation=Gtk.Orientation.VERTICAL)
+        root.add_css_class("dock")
+        root.set_size_request(76, -1)
+        self.set_child(root)
+
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        top.set_margin_top(14)
+        top.append(self.button(lucide("layout-grid", dark=True), primary=True, on_click=lambda b: spawn_shell(
+            f"wofi --show drun -c {HOME}/.config/wofi/mono/config -s {HOME}/.config/wofi/mono/style.css")))
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
+        sw.set_propagate_natural_height(True)
+        self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.list.set_margin_top(8)
+        sw.set_child(self.list)
+        top.append(sw)
+        root.set_start_widget(top)
+
+        self.clock = Gtk.Label(justify=Gtk.Justification.CENTER)
+        self.clock.add_css_class("clock")
+        self.clock.set_margin_top(14)
+        self.clock.set_margin_bottom(14)
+        root.set_center_widget(self.clock)
+
+        bottom = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        bottom.set_margin_bottom(14)
+        self.rec = self.button(lucide("square", dark=True), primary=True, on_click=lambda b: stop_recording())
+        self.rec.set_visible(False)
+        bottom.append(self.rec)
+        self.lang = Gtk.Button(label="EN")
+        self.lang.add_css_class("lang")
+        self.lang.set_halign(Gtk.Align.CENTER)
+        self.lang.connect("clicked", lambda *_: hypr("switchxkblayout", "all", "next"))
+        bottom.append(self.lang)
+        bottom.append(self.button(lucide("power", dark=True), primary=True,
+                                  on_click=lambda b: spawn_shell(f"{HOME}/.local/bin/mono-quick toggle")))
+        root.set_end_widget(bottom)
+
+        self.pending = 0
+        self.rebuild()
+        self.tick()
+        GLib.timeout_add_seconds(5, self.tick)
+        GLib.timeout_add(700, self.rec_tick)
+        threading.Thread(target=self.listen, daemon=True).start()
+
+    # ---------- кнопка: вся ширина дока кликабельна, круг 52 px по центру
+    def button(self, icon, primary=False, dot=None, on_click=None):
+        b = Gtk.Button()
+        b.add_css_class("dockbtn")
+        h = Gtk.Box(halign=Gtk.Align.CENTER)
+        d = Gtk.Box(valign=Gtk.Align.CENTER)
+        d.add_css_class("dot")
+        if not dot:
+            d.add_css_class("off")
+        d.set_margin_end(6)
+        # CenterBox центрирует иконку в круге и не растягивает кнопку по высоте
+        ring = Gtk.CenterBox(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        ring.add_css_class("ring")
+        if primary:
+            ring.add_css_class("primary")
+        icon.set_valign(Gtk.Align.CENTER)
+        ring.set_center_widget(icon)
+        h.append(d)
+        h.append(ring)
+        h.set_margin_end(10)
+        b.set_child(h)
+        if on_click:
+            b.connect("clicked", lambda *_: (self.menuwin.set_visible(False), on_click(b)))
+        return b
+
+    # ---------- события Hyprland
+    def listen(self):
+        sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+        path = os.path.join(RUN, "hypr", sig, ".socket2.sock")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(path)
+        buf = b""
+        watch = ("openwindow", "closewindow", "movewindowv2", "activewindowv2")
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                ev = line.split(b">>", 1)[0].decode()
+                if ev in watch:
+                    GLib.idle_add(self.schedule)
+                elif ev == "activelayout":
+                    GLib.idle_add(self.tick)
+
+    def schedule(self):
+        if not self.pending:
+            self.pending = GLib.timeout_add(120, self.rebuild)
+        return False
+
+    def tick(self):
+        self.clock.set_label(GLib.DateTime.new_now_local().format("%H\n%M"))
+        kb = next((k for k in (hypr_json("devices") or {}).get("keyboards", []) if k.get("main")), None)
+        if kb:
+            self.lang.set_label("RU" if "Russian" in kb.get("active_keymap", "") else "EN")
+        return True
+
+    def rec_tick(self):
+        self.rec.set_visible(recording_pid() is not None)
+        return True
+
+    def rebuild(self):
+        self.pending = 0
+        clear_box(self.list)
+        clients = [c for c in (hypr_json("clients") or []) if c.get("mapped", True) and c.get("class")]
+        by_cls = {}
+        for c in clients:
+            by_cls.setdefault(c["class"].lower(), []).append(c)
+
+        pinned_cls = set()
+        for pin in self.pins:
+            cls = pin.get("class", "").lower()
+            pinned_cls.add(cls)
+            self.list.append(self.app_button(pin, by_cls.get(cls, []), pinned=True))
+        self.list.append(self.button(lucide("clipboard"), on_click=self.open_clip))
+
+        running = [(cls, ws) for cls, ws in by_cls.items() if cls not in pinned_cls]
+        if running:
+            sep = Gtk.Box()
+            sep.add_css_class("sep")
+            self.list.append(sep)
+            for cls, ws in running:
+                info = self.apps.find(ws[0]["class"])
+                entry = {
+                    "name": info.get_display_name() if info else ws[0]["class"],
+                    "icon": "auto",
+                    "exec": self.exec_of(info, ws[0]),
+                    "class": ws[0]["class"],
+                }
+                self.list.append(self.app_button(entry, ws, pinned=False))
+        return False
+
+    def exec_of(self, info, client):
+        if info:
+            cmd = info.get_commandline() or ""
+            return " ".join(p for p in shlex.split(cmd) if not p.startswith("%")) if cmd else ""
+        return client.get("initialClass") or client["class"]
+
+    def icon_for(self, entry):
+        ic = entry.get("icon", "")
+        if ic.startswith("lucide:"):
+            return lucide(ic.split(":", 1)[1])
+        if ic.startswith("brand:"):
+            p = os.path.join(ICONS, "brand", "white", ic.split(":", 1)[1] + ".svg")
+            if os.path.exists(p):
+                return svg(p, 26)
+        p = brand_for_class(entry.get("class"))
+        if p:
+            return svg(p, 26)
+        info = self.apps.find(entry.get("class"))
+        if info and info.get_icon():
+            img = Gtk.Image.new_from_gicon(info.get_icon())
+            img.set_pixel_size(28)
+            img.add_css_class("appicon-color")
+            return img
+        return lucide("app-window")
+
+    def app_button(self, entry, wins, pinned):
+        b = self.button(self.icon_for(entry), dot=bool(wins), on_click=lambda b: self.activate_app(entry, wins))
+        mid = Gtk.GestureClick(button=2)
+        mid.connect("pressed", lambda *_: [hypr("dispatch", "closewindow", f"address:{w['address']}") for w in wins])
+        b.add_controller(mid)
+        right = Gtk.GestureClick(button=3)
+        right.connect("pressed", lambda *_: self.menu(b, entry, wins, pinned))
+        b.add_controller(right)
+        return b
+
+    def open_clip(self, b):
+        spawn_shell(f"{HOME}/.local/bin/mono-clipboard toggle")
+
+    # ---------- действия
+    def activate_app(self, entry, wins):
+        self.clipwin.set_visible(False)
+        if not wins:
+            if entry.get("exec"):
+                spawn_shell(entry["exec"])
+            return
+        active = (hypr_json("activewindow") or {}).get("address")
+        hidden = [w for w in wins if w["workspace"]["name"] == HIDE]
+        if any(w["address"] == active for w in wins):
+            spawn_shell(f"{HOME}/.local/bin/mono-minimize flip {active}")
+        elif hidden:
+            spawn_shell(f"{HOME}/.local/bin/mono-minimize flip {hidden[0]['address']}")
+        else:
+            w = min(wins, key=lambda w: w.get("focusHistoryID", 0))
+            hypr("dispatch", "focuswindow", f"address:{w['address']}")
+
+    def menu(self, btn, entry, wins, pinned):
+        if self.menuwin.get_visible():
+            self.menuwin.set_visible(False)
+            return
+        y = widget_y(btn, self)
+        items = [("Открепить", lambda: self.unpin(entry)) if pinned else ("Закрепить", lambda: self.pin(entry))]
+        if entry.get("exec"):
+            items.append(("Новое окно", lambda: spawn_shell(entry["exec"])))
+        if wins:
+            items.append(("Закрыть", lambda: [hypr("dispatch", "closewindow", f"address:{w['address']}")
+                                               for w in wins]))
+        self.menuwin.open(self.mon, y if y is not None else 200, entry.get("name", ""), items)
+
+    def pin(self, entry):
+        self.pins.append({k: entry[k] for k in ("name", "icon", "exec", "class")})
+        save_pins(self.pins)
+        self.rebuild()
+
+    def unpin(self, entry):
+        self.pins = [p for p in self.pins if p.get("class", "").lower() != entry.get("class", "").lower()]
+        save_pins(self.pins)
+        self.rebuild()
+
+
+def main():
+    try:
+        os.kill(int(open(PID).read()), 0)
+        print("mono-dock уже запущен")
+        return
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        pass
+    open(PID, "w").write(str(os.getpid()))
+
+    css = Gtk.CssProvider()
+    css.load_from_data(CSS)
+    app = Gtk.Application(application_id="dev.mono.dock", flags=Gio.ApplicationFlags.NON_UNIQUE)
+
+    def activate(a):
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        clipwin = ClipWindow(a)
+        shot = ShotOverlay(a)
+        osd = OsdWindow(a)
+        menuwin = MenuWindow(a)
+        dock = Dock(a, clipwin, menuwin)
+        dock.present()
+        overview = OverviewWindow(a, dock)
+        try:
+            overview.tray = tray_mod.Tray(overview.tray_changed)
+        except GLib.Error as e:
+            print("трей не запустился:", e, flush=True)
+        a.hold()
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, lambda: clipwin.toggle(dock.mon, None))
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, shot.toggle)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGHUP, osd.poke)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGWINCH, overview.toggle)
+
+    app.connect("activate", activate)
+    try:
+        app.run([])
+    finally:
+        try:
+            if open(PID).read().strip() == str(os.getpid()):
+                os.remove(PID)
+        except (FileNotFoundError, ValueError):
+            pass
+
+
+if __name__ == "__main__":
+    main()

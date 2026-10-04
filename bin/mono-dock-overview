@@ -1,0 +1,3 @@
+#!/bin/sh
+# обзор открытых окон, как в GNOME (нажать и отпустить Super)
+kill -WINCH "$(cat "${XDG_RUNTIME_DIR:-/tmp}/mono-dock.pid" 2>/dev/null)" 2>/dev/null

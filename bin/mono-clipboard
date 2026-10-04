@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+# mono-clipboard: порт GNOME-расширения Clipboard Indicator (tudmotu) для Hyprland.
+# Та же история и закреплённые: ~/.cache/clipboard-indicator@tudmotu.com/registry.txt (общая с GNOME).
+#   mono-clipboard            фоновый процесс: следит за буфером, держит меню наготове
+#   mono-clipboard toggle     показать / спрятать меню (Super+V, Super+Shift+V)
+import os
+import signal
+import sys
+
+RUN = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+PID = os.path.join(RUN, "mono-clipboard.pid")
+
+if sys.argv[1:2] == ["toggle"]:
+    try:
+        os.kill(int(open(PID).read()), signal.SIGUSR1)
+        sys.exit(0)
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        pass  # не запущен: запускаемся и сразу показываем меню
+
+LIB = "/usr/lib64/libgtk4-layer-shell.so.0"
+if os.path.exists(LIB) and LIB not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = (LIB + " " + os.environ.get("LD_PRELOAD", "")).strip()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+import hashlib  # noqa: E402
+import json  # noqa: E402
+import subprocess  # noqa: E402
+import threading  # noqa: E402
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Gtk4LayerShell as LS  # noqa: E402
+
+CACHE = os.path.expanduser("~/.cache/clipboard-indicator@tudmotu.com")
+REGISTRY = os.path.join(CACHE, "registry.txt")
+STATE = os.path.expanduser("~/.config/mono-clipboard.json")
+HISTORY_SIZE = 20    # как в настройках расширения у пользователя
+PREVIEW_SIZE = 30    # символов в строке
+MAIN_OUTPUT = os.environ.get("MONO_MAIN_OUTPUT", "")
+CLEAN_ENV = {k: v for k, v in os.environ.items() if k != "LD_PRELOAD"}
+
+# метрики и структура меню GNOME Shell 49 (popup-menu), цвета чёрно-белые
+CSS = b"""
+window { background: transparent; }
+.ci-menu {
+  background: #000000; color: #ffffff; border: 1px solid rgba(255,255,255,0.18);
+  border-radius: 14px; padding: 6px; font-size: 11pt;
+}
+.ci-menu button, .ci-menu entry, .ci-menu switch, .ci-menu label, .ci-menu image {
+  background-image: none; box-shadow: none; text-shadow: none; outline: none;
+}
+.ci-search {
+  background: rgba(255,255,255,0.08); color: #ffffff; border: none; border-radius: 999px;
+  min-height: 36px; padding: 0 12px; margin: 6px 6px 8px 6px;
+}
+.ci-search:focus-within { box-shadow: inset 0 0 0 2px rgba(255,255,255,0.55); }
+.ci-item {
+  background: transparent; color: #ffffff; border: none; border-radius: 8px;
+  min-height: 34px; padding: 0 4px 0 12px; margin: 0 0 1px 0;
+}
+.ci-item:hover, .ci-item.focused { background: rgba(255,255,255,0.1); }
+.ci-item label, .ci-footer, .ci-footer label { font-weight: normal; }
+.ci-item:active { background: rgba(255,255,255,0.16); }
+.ci-ornament { min-width: 16px; }
+.ci-dot { background: #ffffff; border-radius: 999px; min-width: 6px; min-height: 6px; }
+.ci-preview { border: 1px solid #ffffff; border-radius: 6px; margin: 4px 8px 4px 0; min-width: 32px; min-height: 32px; }
+.ci-action-btn {
+  background: transparent; color: #ffffff; border: none; border-radius: 999px;
+  min-width: 30px; min-height: 30px; padding: 0;
+}
+.ci-action-btn:hover { background: rgba(255,255,255,0.12); }
+.ci-pin-off { color: rgba(255,255,255,0.3); }
+.ci-sep { background: rgba(255,255,255,0.12); min-height: 1px; margin: 6px 12px; }
+.ci-footer { background: transparent; color: #ffffff; border: none; border-radius: 8px; min-height: 34px; padding: 0 12px; }
+.ci-footer:hover { background: rgba(255,255,255,0.1); }
+.ci-footer.arm { background: #ffffff; color: #000000; }
+.ci-empty { color: #aaaaaa; margin: 40px 0 36px 0; }
+switch { background: rgba(255,255,255,0.15); border: none; border-radius: 999px; }
+switch:checked { background: #ffffff; }
+switch slider { background: #000000; border-radius: 999px; min-width: 20px; min-height: 20px; }
+switch:checked slider { background: #000000; }
+"""
+
+
+def out(*cmd, binary=False, timeout=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL, env=CLEAN_ENV)
+        return r.stdout if binary else r.stdout.decode("utf-8", "replace")
+    except Exception:
+        return b"" if binary else ""
+
+
+def load_state():
+    try:
+        return json.load(open(STATE))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"private": False}
+
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    json.dump(st, open(STATE, "w"))
+
+
+THUMB = 32  # все превью картинок одного размера: квадрат, обрезка по центру
+_thumbs = {}
+
+
+def thumb(path):
+    if path not in _thumbs:
+        try:
+            info = GdkPixbuf.Pixbuf.get_file_info(path)
+            w, h = info[1], info[2]
+            k = THUMB / min(w, h)
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, max(THUMB, round(w * k)), max(THUMB, round(h * k)), False)
+            x, y = (pb.get_width() - THUMB) // 2, (pb.get_height() - THUMB) // 2
+            _thumbs[path] = Gdk.Texture.new_for_pixbuf(pb.new_subpixbuf(x, y, THUMB, THUMB).copy())
+        except Exception:
+            _thumbs[path] = None
+    img = Gtk.Image.new_from_paintable(_thumbs[path]) if _thumbs[path] else Gtk.Image()
+    img.set_pixel_size(THUMB)
+    img.set_size_request(THUMB, THUMB)
+    return img
+
+
+class Registry:
+    """Чтение и запись registry.txt в формате расширения: старые записи первыми, новые последними."""
+
+    def __init__(self):
+        os.makedirs(CACHE, exist_ok=True)
+        self.items = self.read()
+
+    def read(self):
+        try:
+            return json.load(open(REGISTRY))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+    def write(self):
+        tmp = REGISTRY + ".tmp"
+        json.dump(self.items, open(tmp, "w"), ensure_ascii=False)
+        os.replace(tmp, REGISTRY)
+
+    def trim(self):
+        normal = [x for x in self.items if not x.get("favorite")]
+        drop = normal[: max(0, len(normal) - HISTORY_SIZE)]
+        for x in drop:
+            if x["mimetype"].startswith("image/") and os.path.exists(x["contents"]):
+                if not any(y is not x and y["contents"] == x["contents"] for y in self.items):
+                    os.remove(x["contents"])
+            self.items.remove(x)
+
+    def add(self, entry):
+        is_text = lambda m: m.startswith("text/")  # noqa: E731
+        same = next((x for x in self.items if x["contents"] == entry["contents"]
+                     and (x["mimetype"] == entry["mimetype"] or is_text(x["mimetype"]) and is_text(entry["mimetype"]))),
+                    None)
+        if same:
+            # как move-item-first=false в настройках расширения: запись остаётся на своём месте
+            return
+        self.items.append(entry)
+        self.trim()
+        self.write()
+
+
+class Menu(Gtk.ApplicationWindow):
+    def __init__(self, app, reg):
+        super().__init__(application=app)
+        self.reg = reg
+        self.state = load_state()
+        self.current = None  # (mimetype, contents) того, что сейчас в буфере
+        LS.init_for_window(self)
+        LS.set_namespace(self, "mono-clipboard")
+        LS.set_layer(self, LS.Layer.OVERLAY)
+        for e in (LS.Edge.LEFT, LS.Edge.RIGHT, LS.Edge.TOP, LS.Edge.BOTTOM):
+            LS.set_anchor(self, e, True)
+        LS.set_exclusive_zone(self, -1)
+        LS.set_keyboard_mode(self, LS.KeyboardMode.EXCLUSIVE)
+        self.set_hide_on_close(True)
+
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+
+        shade = Gtk.Box(hexpand=True, vexpand=True)
+        outside = Gtk.GestureClick(button=0)
+        outside.connect("pressed", self.on_outside)
+        shade.add_controller(outside)
+        self.set_child(shade)
+
+        self.menu = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.menu.add_css_class("ci-menu")
+        self.menu.set_size_request(400, -1)
+        self.menu.set_halign(Gtk.Align.START)
+        self.menu.set_valign(Gtk.Align.START)
+        self.menu.set_margin_start(90)
+        self.menu.set_margin_top(60)
+        shade.append(self.menu)
+
+        self.search = Gtk.SearchEntry(placeholder_text="Введите текст для поиска…")
+        self.search.add_css_class("ci-search")
+        self.search.connect("search-changed", lambda *_: self.fill())
+        self.search.connect("activate", lambda *_: self.select_first())
+        self.menu.append(self.search)
+
+        self.scroll = Gtk.ScrolledWindow()
+        self.scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.scroll.set_propagate_natural_height(True)
+        self.scroll.set_max_content_height(780)
+        self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.scroll.set_child(self.list)
+        self.menu.append(self.scroll)
+
+
+    # ---------- строители
+    def sep(self):
+        s = Gtk.Box()
+        s.add_css_class("ci-sep")
+        return s
+
+    def icon(self, name, size=16):
+        img = Gtk.Image.new_from_icon_name(name)
+        img.set_pixel_size(size)
+        return img
+
+    def preview_text(self, s):
+        one = " ".join(s.split())
+        return one if len(one) <= PREVIEW_SIZE else one[:PREVIEW_SIZE] + "..."
+
+    def row(self, x):
+        is_img = x["mimetype"].startswith("image/")
+        # строка: Box, а не Button, чтобы звёздочка и корзина не «выбирали» запись
+        b = Gtk.Box(spacing=4)
+        b.add_css_class("ci-item")
+        b.entry = x
+        b.set_focusable(True)
+        h = Gtk.Box(spacing=4, hexpand=True)
+        orn = Gtk.Box(valign=Gtk.Align.CENTER, halign=Gtk.Align.START)
+        orn.add_css_class("ci-ornament")
+        if self.current == (x["mimetype"], x["contents"]):
+            dot = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+            dot.add_css_class("ci-dot")
+            orn.append(dot)
+        h.append(orn)
+        if is_img and os.path.exists(x["contents"]):
+            frame = Gtk.Box(valign=Gtk.Align.CENTER, halign=Gtk.Align.START, hexpand=False)
+            frame.add_css_class("ci-preview")
+            frame.set_overflow(Gtk.Overflow.HIDDEN)
+            frame.append(thumb(x["contents"]))
+            h.append(frame)
+            info = GdkPixbuf.Pixbuf.get_file_info(x["contents"])
+            label = f"Изображение {info[1]}×{info[2]}" if info and info[0] else "Изображение"
+        else:
+            label = self.preview_text(x["contents"])
+        h.append(Gtk.Label(label=label, xalign=0, hexpand=True, ellipsize=3))
+        pick = Gtk.GestureClick(button=1)
+        pick.connect("released", lambda *_: self.choose(x))
+        h.add_controller(pick)
+        b.append(h)
+
+        pin = Gtk.Button()
+        pin.add_css_class("ci-action-btn")
+        fav = bool(x.get("favorite"))
+        pin.set_child(self.icon("starred-symbolic" if fav else "non-starred-symbolic"))
+        if not fav:
+            pin.add_css_class("ci-pin-off")
+        pin.set_tooltip_text("Открепить" if fav else "Закрепить")
+        pin.connect("clicked", lambda *_: self.toggle_fav(x))
+        b.append(pin)
+        rm = Gtk.Button()
+        rm.add_css_class("ci-action-btn")
+        rm.set_child(self.icon("edit-delete-symbolic"))
+        rm.set_tooltip_text("Удалить")
+        rm.connect("clicked", lambda *_: self.delete(x))
+        b.append(rm)
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda c, kv, kc, st: (kv in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space)
+                                                           and (self.choose(x) or True)))
+        b.add_controller(keys)
+        return b
+
+    def fill(self):
+        child = self.list.get_first_child()
+        while child:
+            nxt = child.get_next_sibling()
+            self.list.remove(child)
+            child = nxt
+        q = self.search.get_text().strip().lower()
+        items = list(reversed(self.reg.items))  # новые сверху
+        if q:
+            items = [x for x in items if not x["mimetype"].startswith("image/") and q in x["contents"].lower()]
+        favs = [x for x in items if x.get("favorite")]
+        rest = [x for x in items if not x.get("favorite")]
+        for x in favs:
+            self.list.append(self.row(x))
+        if favs and rest:
+            self.list.append(self.sep())
+        for x in rest:
+            self.list.append(self.row(x))
+        if not favs and not rest:
+            e = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+            e.add_css_class("ci-empty")
+            e.append(self.icon("edit-paste-symbolic", 64))
+            e.append(Gtk.Label(label="ничего не найдено" if q else "Буфер обмена пуст"))
+            self.list.append(e)
+
+    # ---------- показать / спрятать
+    def toggle(self):
+        if self.get_visible():
+            self.set_visible(False)
+            return True
+        self.reg.items = self.reg.read()  # могла поменять GNOME-сессия
+        self.search.set_text("")
+        self.fill()
+        mons = Gdk.Display.get_default().get_monitors()
+        for i in range(mons.get_n_items()):
+            m = mons.get_item(i)
+            if MAIN_OUTPUT and m.get_connector() == MAIN_OUTPUT:
+                LS.set_monitor(self, m)
+        self.present()
+        self.search.grab_focus()
+        return True
+
+    def on_outside(self, g, n, x, y):
+        a = self.menu.get_allocation()
+        if not (a.x <= x <= a.x + a.width and a.y <= y <= a.y + a.height):
+            self.set_visible(False)
+
+    def on_key(self, ctrl, kv, kc, state):
+        if kv == Gdk.KEY_Escape:
+            self.set_visible(False)
+            return True
+        if kv == Gdk.KEY_Down and self.search.has_focus():
+            first = self.list.get_first_child()
+            if first:
+                first.grab_focus()
+            return True
+        return False
+
+    # ---------- действия
+    def choose(self, x):
+        if x["mimetype"].startswith("image/"):
+            with open(x["contents"], "rb") as f:
+                subprocess.Popen(["wl-copy", "--type", x["mimetype"]], stdin=f, start_new_session=True, env=CLEAN_ENV)
+        else:
+            p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE, start_new_session=True, env=CLEAN_ENV)
+            p.communicate(x["contents"].encode())
+        self.current = (x["mimetype"], x["contents"])
+        self.set_visible(False)
+
+    def select_first(self):
+        first = self.list.get_first_child()
+        if first is not None and hasattr(first, "entry"):
+            self.choose(first.entry)
+
+    def toggle_fav(self, x):
+        x["favorite"] = not x.get("favorite")
+        self.reg.trim()
+        self.reg.write()
+        self.fill()
+
+    def delete(self, x):
+        # как в расширении: удалили то, что сейчас в буфере, значит, буфер очищается
+        if self.current and self.current[1] == x["contents"]:
+            subprocess.Popen(["wl-copy", "--clear"], start_new_session=True, env=CLEAN_ENV)
+            self.current = None
+        if x in self.reg.items:
+            self.reg.items.remove(x)
+            if x["mimetype"].startswith("image/") and os.path.exists(x["contents"]):
+                os.remove(x["contents"])
+            self.reg.write()
+        self.fill()
+
+    def on_private(self, sw, _):
+        self.state["private"] = sw.get_active()
+        save_state(self.state)
+
+    def on_clear(self, btn):
+        # как confirm-clear в расширении: второе нажатие подтверждает; закреплённое остаётся
+        if not btn.has_css_class("arm"):
+            btn.add_css_class("arm")
+            btn.set_label("Нажми ещё раз, чтобы очистить")
+            return
+        for x in [x for x in self.reg.items if not x.get("favorite")]:
+            self.delete(x)
+        btn.remove_css_class("arm")
+        btn.set_label("Очистить историю")
+        self.fill()
+
+    # ---------- приём нового содержимого буфера
+    def ingest(self):
+        if self.state.get("private"):
+            return False
+        types = out("wl-paste", "--list-types").split()
+        if any("passwordManagerHint" in t or "x-kde-passwordManager" in t for t in types):
+            return False
+        if any(t.startswith("text/plain") or t in ("UTF8_STRING", "TEXT", "STRING") for t in types):
+            text = out("wl-paste", "--no-newline")
+            if not text.strip():
+                return False
+            entry = {"favorite": False, "mimetype": "text/plain;charset=utf-8", "contents": text}
+        elif "image/png" in types:
+            data = out("wl-paste", "--type", "image/png", binary=True)
+            if not data:
+                return False
+            path = os.path.join(CACHE, str(int(hashlib.sha1(data).hexdigest()[:8], 16)))
+            if not os.path.exists(path):
+                open(path, "wb").write(data)
+            entry = {"favorite": False, "mimetype": "image/png", "contents": path}
+        else:
+            return False
+        self.reg.add(entry)
+        self.current = (entry["mimetype"], entry["contents"])
+        if self.get_visible():
+            self.fill()
+        return False
+
+
+def watch(menu):
+    # wl-paste --watch печатает строку на каждое изменение буфера
+    p = subprocess.Popen(["wl-paste", "--watch", "echo", "x"], stdout=subprocess.PIPE, env=CLEAN_ENV)
+    for _ in p.stdout:
+        GLib.idle_add(menu.ingest)
+
+
+def main():
+    try:
+        os.kill(int(open(PID).read()), 0)
+        print("mono-clipboard уже запущен")
+        return
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        pass
+    open(PID, "w").write(str(os.getpid()))
+    show_now = sys.argv[1:2] == ["toggle"]
+
+    css = Gtk.CssProvider()
+    css.load_from_data(CSS)
+    app = Gtk.Application(application_id="dev.mono.clipboard", flags=Gio.ApplicationFlags.NON_UNIQUE)
+
+    def activate(a):
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        menu = Menu(a, Registry())
+        a.hold()
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, menu.toggle)
+        threading.Thread(target=watch, args=(menu,), daemon=True).start()
+        if show_now:
+            menu.toggle()
+
+    app.connect("activate", activate)
+    try:
+        app.run([])
+    finally:
+        try:
+            if open(PID).read().strip() == str(os.getpid()):
+                os.remove(PID)
+        except (FileNotFoundError, ValueError):
+            pass
+
+
+if __name__ == "__main__":
+    main()

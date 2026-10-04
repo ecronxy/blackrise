@@ -1,0 +1,25 @@
+/* mono: части окна VS Code как отдельные скруглённые пилюли на чёрном фоне */
+.monaco-workbench { background: #000000 !important; }
+.monaco-workbench .part.activitybar,
+.monaco-workbench .part.sidebar,
+.monaco-workbench .part.editor,
+.monaco-workbench .part.panel,
+.monaco-workbench .part.auxiliarybar {
+  position: relative;
+  clip-path: inset(5px round 18px);
+}
+.monaco-workbench .part.activitybar::after,
+.monaco-workbench .part.sidebar::after,
+.monaco-workbench .part.editor::after,
+.monaco-workbench .part.panel::after,
+.monaco-workbench .part.auxiliarybar::after {
+  content: "";
+  position: absolute;
+  inset: 5px;
+  border: 1px solid #ffffff;
+  border-radius: 18px;
+  pointer-events: none;
+  z-index: 1000;
+}
+.monaco-workbench .part.editor > .content { padding-top: 4px; }
+.monaco-workbench .part.statusbar { border-radius: 0; }

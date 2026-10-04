@@ -1,0 +1,38 @@
+/* mono: чёрно-белые программы на GTK4/libadwaita (Nautilus, Настройки и др.) */
+:root {
+  --accent-bg-color: #ffffff; --accent-fg-color: #000000; --accent-color: #ffffff;
+  --window-bg-color: #000000; --window-fg-color: #ffffff;
+  --view-bg-color: #000000; --view-fg-color: #ffffff;
+  --headerbar-bg-color: #000000; --headerbar-fg-color: #ffffff; --headerbar-backdrop-color: #000000;
+  --sidebar-bg-color: #000000; --sidebar-fg-color: #ffffff; --sidebar-backdrop-color: #000000;
+  --secondary-sidebar-bg-color: #000000; --secondary-sidebar-fg-color: #ffffff;
+  --card-bg-color: #0d0d0d; --card-fg-color: #ffffff;
+  --dialog-bg-color: #000000; --dialog-fg-color: #ffffff;
+  --popover-bg-color: #000000; --popover-fg-color: #ffffff;
+  --thumbnail-bg-color: #0d0d0d;
+}
+@define-color accent_bg_color #ffffff;
+@define-color accent_fg_color #000000;
+@define-color accent_color #ffffff;
+@define-color window_bg_color #000000;
+@define-color window_fg_color #ffffff;
+@define-color view_bg_color #000000;
+@define-color view_fg_color #ffffff;
+@define-color headerbar_bg_color #000000;
+@define-color headerbar_fg_color #ffffff;
+@define-color sidebar_bg_color #000000;
+@define-color sidebar_fg_color #ffffff;
+@define-color card_bg_color #0d0d0d;
+@define-color popover_bg_color #000000;
+@define-color dialog_bg_color #000000;
+
+/* выделение: белое, текст чёрный */
+gridview > child:selected, columnview > listview > row:selected, listview > row:selected,
+.navigation-sidebar > row:selected {
+  background-color: #ffffff; color: #000000;
+}
+/* значки файлов и папок чёрно-белые */
+gridview image, gridview picture, columnview image, columnview picture,
+.navigation-sidebar image { filter: grayscale(1) brightness(1.15); }
+/* плашка «Выделен объект…» поверх подписей файлов: не нужна */
+.floating-bar { opacity: 0; }

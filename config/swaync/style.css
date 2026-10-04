@@ -1,0 +1,107 @@
+/* blackrise: чёрно-белый круглый центр управления и уведомления */
+* {
+  font-family: "Hack Nerd Font Mono", monospace;
+  font-size: 13px;
+  outline: none;
+  box-shadow: none;
+  text-shadow: none;
+}
+
+/* ---------- панель */
+.control-center {
+  background: #000000;
+  color: #ffffff;
+  border: 1px solid #ffffff;
+  border-radius: 28px;
+  padding: 14px;
+}
+.control-center-list { background: transparent; }
+.control-center-list-placeholder { color: #ffffff; opacity: 0.5; }
+
+/* ---------- заголовок и «Очистить» */
+.widget-title { margin: 4px 6px 10px 6px; color: #ffffff; font-size: 16px; font-weight: bold; }
+.widget-title > button {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px;
+  padding: 4px 14px; font-size: 12px; font-weight: normal;
+}
+.widget-title > button:hover { background: #ffffff; color: #000000; }
+
+/* ---------- не беспокоить */
+.widget-dnd { margin: 2px 6px 12px 6px; color: #ffffff; font-size: 13px; }
+.widget-dnd > switch { background: #000000; border: 1px solid #ffffff; border-radius: 999px; }
+.widget-dnd > switch:checked { background: #ffffff; }
+.widget-dnd > switch slider { background: #ffffff; border-radius: 999px; }
+.widget-dnd > switch:checked slider { background: #000000; }
+
+/* ---------- сетка кнопок-капсул */
+.widget-buttons-grid { padding: 4px 0 10px 0; }
+.widget-buttons-grid flowboxchild > button {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px;
+  min-height: 44px; min-width: 112px; margin: 3px; padding: 0 10px; font-size: 13px;
+}
+.widget-buttons-grid flowboxchild > button:hover { box-shadow: inset 0 0 0 1px #ffffff; }
+.widget-buttons-grid flowboxchild > button.toggle:checked { background: #ffffff; color: #000000; }
+
+/* ---------- громкость */
+.widget-volume {
+  background: #000000; border: 1px solid #ffffff; border-radius: 999px;
+  margin: 6px 0; padding: 8px 16px; color: #ffffff;
+}
+.widget-volume trough { background: #000000; border: 1px solid #ffffff; border-radius: 999px; min-height: 8px; }
+.widget-volume highlight { background: #ffffff; border-radius: 999px; }
+.widget-volume slider { background: #ffffff; border-radius: 999px; min-width: 16px; min-height: 16px; border: none; }
+
+/* ---------- плеер */
+.widget-mpris { margin: 6px 0; }
+.widget-mpris-player {
+  background: #000000; border: 1px solid #ffffff; border-radius: 24px; padding: 12px; color: #ffffff;
+}
+.widget-mpris-title { font-weight: bold; font-size: 14px; }
+.widget-mpris-subtitle { font-size: 12px; opacity: 0.7; }
+.widget-mpris-player button {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px;
+  min-width: 36px; min-height: 36px; margin: 0 3px;
+}
+.widget-mpris-player button:hover { background: #ffffff; color: #000000; }
+
+/* ---------- уведомления (в панели и всплывающие) */
+.notification-row { background: transparent; outline: none; }
+.notification-row:focus, .notification-row:hover { background: transparent; }
+.notification {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 22px;
+  margin: 6px 0; padding: 0;
+}
+.notification-content { padding: 12px; }
+.notification-default-action { border-radius: 22px; background: transparent; }
+.notification-default-action:hover { background: rgba(255, 255, 255, 0.06); }
+.summary { font-weight: bold; font-size: 13px; color: #ffffff; }
+.time { font-size: 11px; color: #ffffff; opacity: 0.6; margin-right: 26px; }
+.body { font-size: 12px; color: #ffffff; opacity: 0.85; }
+.image { border-radius: 12px; }
+.body-image { border-radius: 14px; margin-top: 8px; }
+.notification-action {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px; margin: 4px;
+}
+.notification-action:hover { background: #ffffff; color: #000000; }
+.close-button {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px;
+  min-width: 24px; min-height: 24px; margin: 10px; padding: 0;
+}
+.close-button:hover { background: #ffffff; color: #000000; }
+.notification.critical { border-width: 2px; }
+
+/* всплывающие окна уведомлений */
+.floating-notifications { background: transparent; }
+.floating-notifications .notification { margin: 8px 14px; }
+
+/* группы */
+.notification-group { background: transparent; }
+.notification-group-headers { color: #ffffff; }
+.notification-group-icon { color: #ffffff; }
+.notification-group-collapse-button, .notification-group-close-all-button {
+  background: #000000; color: #ffffff; border: 1px solid #ffffff; border-radius: 999px;
+}
+
+/* ячейки сетки без серой подложки фокуса */
+.widget-buttons-grid flowboxchild, .widget-buttons-grid flowboxchild:focus,
+.widget-buttons-grid flowboxchild:hover, .widget-buttons-grid flowboxchild:selected { background: transparent; }

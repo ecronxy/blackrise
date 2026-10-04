@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+# mono-minimize: «свернуть» для Hyprland (своего минимизирования в нём нет).
+# Клик по окну на полосе (waybar wlr/taskbar, действие minimize-raise) шлёт Hyprland запрос
+# свернуть; тут мы прячем окно на скрытый стол special:minimized, а повторный клик возвращает
+# его на текущий стол.
+#   mono-minimize          фоновый обработчик событий (запускается при входе)
+#   mono-minimize toggle   свернуть активное окно / вернуть последнее свёрнутое (Super+M)
+import json
+import os
+import socket
+import subprocess
+import sys
+
+HIDE = "special:minimized"
+# откуда окно свернули: адрес -> номер стола (чтобы вернуть туда же)
+ORIGIN = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "mono-minimize.json")
+
+
+def origins():
+    try:
+        return json.load(open(ORIGIN))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def hypr(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+
+def clients():
+    try:
+        return json.loads(hypr("clients", "-j"))
+    except json.JSONDecodeError:
+        return []
+
+
+def active_ws():
+    try:
+        return json.loads(hypr("activeworkspace", "-j"))["id"]
+    except (json.JSONDecodeError, KeyError):
+        return 1
+
+
+def hide(addr, ws=None, floating=False):
+    o = origins()
+    o[addr] = {"ws": ws if ws is not None else active_ws(), "floating": floating}
+    json.dump(o, open(ORIGIN, "w"))
+    hypr("dispatch", "movetoworkspacesilent", f"{HIDE},address:{addr}")
+
+
+def restore(addr):
+    o = origins()
+    rec = o.pop(addr, None) or {}
+    if not isinstance(rec, dict):
+        rec = {"ws": rec}
+    json.dump(o, open(ORIGIN, "w"))
+    hypr("dispatch", "movetoworkspace", f"{rec.get('ws') or active_ws()},address:{addr}")
+    # вернуть в сетку, если окно было в сетке (иначе оно ложится поверх остальных)
+    if not rec.get("floating"):
+        hypr("dispatch", "settiled", f"address:{addr}")
+    hypr("dispatch", "focuswindow", f"address:{addr}")
+
+
+def flip(addr):
+    c = next((c for c in clients() if c["address"] == addr), None)
+    if not c:
+        return
+    if c["workspace"]["name"] == HIDE:
+        restore(addr)
+    else:
+        hide(addr, c["workspace"]["id"], c.get("floating", False))
+
+
+def toggle():
+    try:
+        act = json.loads(hypr("activewindow", "-j"))
+    except json.JSONDecodeError:
+        act = {}
+    if act.get("address") and act.get("workspace", {}).get("name") != HIDE:
+        hide(act["address"], act["workspace"]["id"], act.get("floating", False))
+        return
+    hidden = [c for c in clients() if c["workspace"]["name"] == HIDE]
+    if hidden:
+        # последнее свёрнутое = меньший focusHistoryID
+        restore(min(hidden, key=lambda c: c.get("focusHistoryID", 0))["address"])
+
+
+def watch():
+    sig = os.environ["HYPRLAND_INSTANCE_SIGNATURE"]
+    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hypr", sig, ".socket2.sock")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(path)
+    buf = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            ev, _, data = line.decode(errors="replace").partition(">>")
+            if ev == "minimized":
+                # minimized>>АДРЕС,1  (адрес без 0x)
+                addr = "0x" + data.split(",")[0]
+                flip(addr)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["toggle"]:
+        toggle()
+    elif sys.argv[1:2] == ["flip"] and len(sys.argv) > 2:
+        flip(sys.argv[2])
+    else:
+        watch()

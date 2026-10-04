@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+# earthfetch: fastfetch + вращающаяся ASCII-Земля (кадры с https://ascii.live/earth).
+# Раскладка под размер окна: широкое — шар слева, данные справа; узкое — шар сверху, данные снизу;
+# среднее — шар вдвое меньше; совсем маленькое — только данные. Строки не переносятся.
+# Крутится, пока не нажмёшь любую клавишу (клавиша не уходит в шелл).
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import tty
+
+FRAMES = os.path.expanduser("~/.local/share/mono-earth/frames.json")
+FPS = 12
+GAP = 3
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def fix_line(t):
+    # fastfetch выравнивает подписи прыжком в колонку (ESC[nG): превращаем в пробелы
+    m = re.search(r"\x1b\[(\d+)G", t)
+    if m:
+        before = ANSI.sub("", t[: m.start()])
+        t = t[: m.start()] + " " * max(1, int(m.group(1)) - 1 - len(before)) + t[m.end():]
+    t = ANSI.sub("", t)
+    # родитель fastfetch здесь этот скрипт, поэтому шелл подставляем сами
+    if "│ shell" in t:
+        sh = os.path.basename(os.environ.get("SHELL", "zsh"))
+        ver = subprocess.run([sh, "--version"], capture_output=True, text=True).stdout.split()
+        name = f"{sh} {ver[1]}" if len(ver) > 1 else sh
+        t = re.sub(r"(│ shell\s+)\S.*$", lambda mm: mm.group(1) + name, t)
+    return t.rstrip()
+
+
+def half(frames):
+    # уменьшить шар вдвое: каждая вторая строка и каждый второй символ
+    return [[ln[::2] for ln in fr[::2]] for fr in frames]
+
+
+def main():
+    data = json.load(open(FRAMES))
+    frames = data["frames"]
+    info = [fix_line(t) for t in subprocess.run(
+        ["fastfetch", "--logo", "none", "--pipe", "true"], capture_output=True, text=True
+    ).stdout.rstrip("\n").splitlines()]
+    cols, rows = shutil.get_terminal_size((80, 24))
+    rows -= 2  # место под промпт
+    iw = max((len(t) for t in info), default=0)
+
+    layout = None
+    for fr in (frames, half(frames)):
+        w = max(len(ln) for f in fr for ln in f)
+        h = len(fr[0])
+        if cols >= 1 + w + GAP + min(iw, 40) and rows >= max(h, len(info)):
+            layout = ("side", fr, w, h)
+            break
+        if cols >= w + 1 and rows >= h + len(info) + 1:
+            layout = ("stack", fr, w, h)
+            break
+
+    if not layout:  # окно маленькое: только данные
+        print("\n".join(t[: cols - 1] for t in info))
+        return
+
+    kind, fr, w, h = layout
+    if kind == "side":
+        tw = cols - 2 - w - GAP
+        n = max(h, len(info))
+        top = (n - h) // 2
+        body = [(fr[0][i - top] if 0 <= i - top < h else "").ljust(w) + " " * GAP + (info[i][:tw] if i < len(info) else "")
+                for i in range(n)]
+        globe_rows = (top, h)  # где на экране строки шара
+        total = n
+    else:
+        body = [ln.ljust(w) for ln in fr[0]] + [""] + [t[: cols - 1] for t in info]
+        globe_rows = (0, h)
+        total = len(body)
+
+    out = sys.stdout
+    out.write("\n".join(" " + b for b in body) + "\n")
+    if not (sys.stdin.isatty() and out.isatty()):
+        return
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    out.write("\x1b[?25l")
+    try:
+        tty.setcbreak(fd)
+        start, gh = globe_rows
+        k = 0
+        while True:
+            if select.select([sys.stdin], [], [], 1 / FPS)[0]:
+                os.read(fd, 64)
+                break
+            k = (k + 1) % len(fr)
+            f = fr[k]
+            # подняться к первой строке шара, перерисовать только его колонку, вернуться вниз
+            out.write(f"\x1b[{total - start}A")
+            for i in range(gh):
+                out.write("\r " + f[i].ljust(w) + "\x1b[1B")
+            rest = total - start - gh
+            if rest > 0:
+                out.write(f"\x1b[{rest}B")
+            out.write("\r")
+            out.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        out.write("\x1b[?25h")
+        out.flush()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.stdout.write("\x1b[?25h\n")

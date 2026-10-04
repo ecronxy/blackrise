@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+# mono-screenshot: панель снимка экрана как в GNOME Shell (Super+Shift+S, Ctrl+Shift+S, Print).
+# Рисует панель снизу и рамку выделения (только затемнение и белая рамка, без картинки экрана).
+# Замороженный кадр даёт hyprpicker, снимок grim, видео wf-recorder.
+#   режимы: Выделение / Экран / Окно; переключатель Фото / Видео; показывать курсор.
+#   Выделение: тянешь рамку (можно перетянуть заново). Экран: монитор под курсором. Окно: клик по окну.
+#   Enter или Пробел снимает, Esc закрывает. Во время записи то же сочетание её останавливает.
+#   mono-screenshot            фоновый процесс
+#   mono-screenshot toggle     открыть панель / остановить запись
+import os
+import signal
+import sys
+
+RUN = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+PID = os.path.join(RUN, "mono-screenshot.pid")
+REC_PID = os.path.join(RUN, "mono-rec.pid")  # по нему док показывает кнопку «стоп»
+
+if sys.argv[1:2] == ["toggle"]:
+    try:
+        os.kill(int(open(PID).read()), signal.SIGUSR1)
+        sys.exit(0)
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        pass
+
+LIB = "/usr/lib64/libgtk4-layer-shell.so.0"
+if os.path.exists(LIB) and LIB not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = (LIB + " " + os.environ.get("LD_PRELOAD", "")).strip()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+import json  # noqa: E402
+import subprocess  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_version("Graphene", "1.0")
+from gi.repository import Gdk, Gio, GLib, Graphene, Gtk  # noqa: E402
+from gi.repository import Gtk4LayerShell as LS  # noqa: E402
+
+HOME = os.path.expanduser("~")
+CLEAN_ENV = {k: v for k, v in os.environ.items() if k != "LD_PRELOAD"}
+SHOTS = os.path.join(HOME, "Изображения", "Снимки экрана")
+CASTS = os.path.join(HOME, "Видео", "Записи экрана")
+ICONS = {
+    "area": f"{HOME}/.local/share/mono-icons/gnome-shell/screenshot-ui-area-symbolic.svg",
+    "display": f"{HOME}/.local/share/mono-icons/gnome-shell/screenshot-ui-display-symbolic.svg",
+    "window": f"{HOME}/.local/share/mono-icons/gnome-shell/screenshot-ui-window-symbolic.svg",
+    "pointer": f"{HOME}/.local/share/mono-icons/gnome-shell/screenshot-ui-show-pointer-symbolic.svg",
+    "photo": "/usr/share/icons/Adwaita/symbolic/devices/camera-photo-symbolic.svg",
+    "video": "/usr/share/icons/Adwaita/symbolic/devices/camera-web-symbolic.svg",
+    "close": "/usr/share/icons/Adwaita/symbolic/ui/window-close-symbolic.svg",
+}
+
+# метрики screenshot-ui из GNOME Shell 49, цвета чёрно-белые
+CSS = b"""
+window { background: transparent; }
+.ss button, .ss label, .ss image { background-image: none; box-shadow: none; text-shadow: none; outline: none; }
+.ss {
+  background: #000000; color: #ffffff; border: 1px solid rgba(255,255,255,0.18);
+  border-radius: 28px; padding: 14px 18px 18px 18px; font-size: 11pt;
+}
+.ss-close {
+  background: rgba(255,255,255,0.1); color: #ffffff; border: none; border-radius: 999px;
+  min-width: 32px; min-height: 32px; padding: 0;
+}
+.ss-close:hover { background: rgba(255,255,255,0.18); }
+.ss-type {
+  background: rgba(255,255,255,0.1); color: #ffffff; border: none; border-radius: 14px;
+  min-width: 96px; padding: 10px 16px; margin: 0 4px;
+}
+.ss-type:hover { background: rgba(255,255,255,0.18); }
+.ss-type.on { background: #ffffff; color: #000000; }
+.ss-type label { font-weight: normal; font-size: 10pt; }
+.ss-switch { background: rgba(255,255,255,0.1); border-radius: 999px; padding: 3px; }
+.ss-switch button {
+  background: transparent; color: #ffffff; border: none; border-radius: 999px;
+  min-width: 38px; min-height: 32px; padding: 0;
+}
+.ss-switch button.on { background: #ffffff; color: #000000; }
+.ss-shoot {
+  background: #000000; border: 4px solid #ffffff; border-radius: 999px;
+  min-width: 56px; min-height: 56px; padding: 4px;
+}
+.ss-dot { background: #ffffff; border-radius: 999px; min-width: 48px; min-height: 48px; }
+.ss-shoot:hover .ss-dot { background: rgba(255,255,255,0.8); }
+.ss-shoot.rec .ss-dot { min-width: 24px; min-height: 24px; margin: 12px; }
+.ss-pointer {
+  background: rgba(255,255,255,0.1); color: #ffffff; border: none; border-radius: 999px;
+  min-width: 38px; min-height: 38px; padding: 0;
+}
+.ss-pointer.on { background: #ffffff; color: #000000; }
+.ss-hint { font-size: 9pt; margin-top: 2px; }
+"""
+
+
+def icon(key, size=16):
+    img = Gtk.Image.new_from_gicon(Gio.FileIcon.new(Gio.File.new_for_path(ICONS[key])))
+    img.set_pixel_size(size)
+    return img
+
+
+def hypr(what):
+    try:
+        return json.loads(subprocess.run(["hyprctl", "-j", what], capture_output=True, env=CLEAN_ENV,
+                                         timeout=3).stdout)
+    except Exception:
+        return None
+
+
+def popen(cmd, **kw):
+    kw.setdefault("stdin", subprocess.DEVNULL)
+    return subprocess.Popen(cmd, env=CLEAN_ENV, **kw)
+
+
+def notify(title, body, icon_path=None):
+    cmd = ["notify-send", "-a", "Снимок экрана", title, body]
+    if icon_path:
+        cmd[1:1] = ["-i", icon_path]
+    popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stamp():
+    return time.strftime("%Y-%m-%d %H-%M-%S")
+
+
+def recording_pid():
+    try:
+        pid = int(open(REC_PID).read())
+        os.kill(pid, 0)
+        return pid
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        return None
+
+
+class Shade(Gtk.Widget):
+    """затемнение вокруг выделения и белая рамка: несколько залитых прямоугольников"""
+
+    DIM = Gdk.RGBA(red=0, green=0, blue=0, alpha=0.5)
+    WHITE = Gdk.RGBA(red=1, green=1, blue=1, alpha=1)
+
+    def __init__(self):
+        super().__init__(hexpand=True, vexpand=True)
+        self.rect = None   # (x, y, w, h) в координатах монитора
+        self.full = False  # режим «Экран»: рамка по краю, без затемнения
+
+    def do_snapshot(self, snap):
+        W, H = self.get_width(), self.get_height()
+
+        def fill(c, x, y, w, h):
+            if w > 0 and h > 0:
+                snap.append_color(c, Graphene.Rect().init(x, y, w, h))
+        if self.full:
+            x, y, w, h = 0, 0, W, H
+        elif not self.rect:
+            fill(self.DIM, 0, 0, W, H)
+            return
+        else:
+            x, y, w, h = self.rect
+            fill(self.DIM, 0, 0, W, y)
+            fill(self.DIM, 0, y + h, W, H - y - h)
+            fill(self.DIM, 0, y, x, h)
+            fill(self.DIM, x + w, y, W - x - w, h)
+        b = 2
+        fill(self.WHITE, x - b, y - b, w + 2 * b, b)
+        fill(self.WHITE, x - b, y + h, w + 2 * b, b)
+        fill(self.WHITE, x - b, y, b, h)
+        fill(self.WHITE, x + w, y, b, h)
+
+
+class Selector:
+    """затемнение во весь монитор под панелью: тянуть рамку или выбрать окно"""
+
+    def __init__(self, panel):
+        self.panel = panel
+        self.shade = Shade()
+        self.mon, self.mode, self.area, self.start = None, "area", None, None
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self.on_begin)
+        drag.connect("drag-update", self.on_update)
+        drag.connect("drag-end", self.on_end)
+        self.shade.add_controller(drag)
+
+    def reset(self, mon, mode):
+        self.mon = mon
+        self.set_mode(mode)
+
+    def set_mode(self, mode):
+        self.mode = mode
+        self.shade.full = mode == "display"
+        self.shade.rect = self.area if mode == "area" else None
+        self.shade.set_cursor_from_name("crosshair" if mode == "area" else "default")
+        self.shade.queue_draw()
+
+    def on_begin(self, g, x, y):
+        self.start = (x, y)
+        if self.mode == "area":
+            self.panel.dragging(True)  # как в GNOME: пока тянешь рамку, панели не видно
+        if self.mode == "window":
+            self.pick_window(x, y)
+
+    def on_update(self, g, dx, dy):
+        if self.mode != "area" or not self.start:
+            return
+        x0, y0 = self.start
+        x1, y1 = x0 + dx, y0 + dy
+        self.shade.rect = (round(min(x0, x1)), round(min(y0, y1)), round(abs(dx)), round(abs(dy)))
+        self.shade.queue_draw()
+
+    def on_end(self, g, dx, dy):
+        if self.mode == "area":
+            r = self.shade.rect
+            self.area = r if r and r[2] > 3 and r[3] > 3 else self.area
+            self.shade.rect = self.area
+            self.shade.queue_draw()
+            self.panel.hint.set_text("Пробел: снять" if self.area else "Выделите область")
+            self.panel.dragging(False)
+
+    def pick_window(self, x, y):
+        mx, my = (self.mon["x"], self.mon["y"]) if self.mon else (0, 0)
+        gx, gy = x + mx, y + my
+        ws = {m["activeWorkspace"]["id"] for m in (hypr("monitors") or [])}
+        hits = [c for c in (hypr("clients") or []) if c["workspace"]["id"] in ws and c.get("mapped", True)
+                and c["at"][0] <= gx < c["at"][0] + c["size"][0] and c["at"][1] <= gy < c["at"][1] + c["size"][1]]
+        if hits:
+            c = min(hits, key=lambda c: c.get("focusHistoryID", 99))
+            self.shade.rect = (c["at"][0] - mx, c["at"][1] - my, c["size"][0], c["size"][1])
+            self.panel.hint.set_text("Пробел: снять")
+            self.panel.place()
+        self.shade.queue_draw()
+
+    def geometry(self):
+        r = self.shade.rect
+        if not r:
+            return None
+        mx, my = (self.mon["x"], self.mon["y"]) if self.mon else (0, 0)
+        return f"{r[0] + mx},{r[1] + my} {r[2]}x{r[3]}"
+
+
+class Panel(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        LS.init_for_window(self)
+        LS.set_namespace(self, "mono-screenshot")
+        LS.set_layer(self, LS.Layer.OVERLAY)
+        # один слой на весь монитор: затемнение с рамкой и панель поверх. Два слоя с захватом
+        # клавиатуры нельзя: Hyprland отдаёт мышь только тому, у кого фокус.
+        for e in (LS.Edge.LEFT, LS.Edge.RIGHT, LS.Edge.TOP, LS.Edge.BOTTOM):
+            LS.set_anchor(self, e, True)
+        LS.set_exclusive_zone(self, -1)
+        LS.set_keyboard_mode(self, LS.KeyboardMode.EXCLUSIVE)
+        self.set_hide_on_close(True)
+        self.mode, self.video, self.pointer = "area", False, False
+        self.freeze = None   # hyprpicker: замороженный кадр
+        self.active = False
+        self.mon = None
+        self.sel = Selector(self)
+
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)  # раньше кнопок: Пробел не должен нажимать крестик
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.add_css_class("ss")
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.END)
+        box.set_margin_bottom(36)
+        self.box = box
+        over = Gtk.Overlay()
+        over.set_child(self.sel.shade)
+        over.add_overlay(box)
+        self.set_child(over)
+
+        top = Gtk.Box()
+        top.append(Gtk.Box(hexpand=True))
+        close = Gtk.Button(child=icon("close"))
+        close.add_css_class("ss-close")
+        close.connect("clicked", lambda *_: self.close_all())
+        top.append(close)
+        box.append(top)
+
+        types = Gtk.Box(halign=Gtk.Align.CENTER)
+        self.type_btns = {}
+        for key, text in (("area", "Выделение"), ("display", "Экран"), ("window", "Окно")):
+            b = Gtk.Button()
+            b.add_css_class("ss-type")
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            col.append(icon(key, 24))
+            col.append(Gtk.Label(label=text))
+            b.set_child(col)
+            b.connect("clicked", lambda _b, k=key: self.set_mode(k))
+            types.append(b)
+            self.type_btns[key] = b
+        box.append(types)
+
+        bottom = Gtk.CenterBox()
+        sw = Gtk.Box()
+        sw.add_css_class("ss-switch")
+        sw.set_valign(Gtk.Align.CENTER)
+        self.b_photo = Gtk.Button(child=icon("photo"))
+        self.b_video = Gtk.Button(child=icon("video"))
+        self.b_photo.connect("clicked", lambda *_: self.set_video(False))
+        self.b_video.connect("clicked", lambda *_: self.set_video(True))
+        sw.append(self.b_photo)
+        sw.append(self.b_video)
+        bottom.set_start_widget(sw)
+        self.shoot = Gtk.Button()
+        self.shoot.add_css_class("ss-shoot")
+        dot = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        dot.add_css_class("ss-dot")
+        self.shoot.set_child(dot)
+        self.shoot.connect("clicked", lambda *_: self.capture())
+        bottom.set_center_widget(self.shoot)
+        self.b_pointer = Gtk.Button(child=icon("pointer"))
+        self.b_pointer.add_css_class("ss-pointer")
+        self.b_pointer.set_valign(Gtk.Align.CENTER)
+        self.b_pointer.connect("clicked", lambda *_: self.set_pointer(not self.pointer))
+        bottom.set_end_widget(self.b_pointer)
+        box.append(bottom)
+        self.hint = Gtk.Label()
+        self.hint.add_css_class("ss-hint")
+        box.append(self.hint)
+        for b in (close, self.b_photo, self.b_video, self.shoot, self.b_pointer, *self.type_btns.values()):
+            b.set_focusable(False)
+        self.sync()
+
+    # ---------- состояние кнопок
+    def sync(self):
+        for k, b in self.type_btns.items():
+            (b.add_css_class if k == self.mode else b.remove_css_class)("on")
+        (self.b_photo.remove_css_class if self.video else self.b_photo.add_css_class)("on")
+        (self.b_video.add_css_class if self.video else self.b_video.remove_css_class)("on")
+        (self.b_pointer.add_css_class if self.pointer else self.b_pointer.remove_css_class)("on")
+        (self.shoot.add_css_class if self.video else self.shoot.remove_css_class)("rec")
+        self.hint.set_text({"area": "Выделите область", "display": "Снимется экран под курсором",
+                            "window": "Нажмите на окно"}[self.mode])
+        if self.mode != "display" and self.sel.geometry():
+            self.hint.set_text("Пробел: снять")
+
+    def dragging(self, on):
+        """пока тянешь рамку, панель полупрозрачная и не мешает мыши"""
+        self.box.set_can_target(not on)
+        if on:
+            self.box.set_opacity(0.35)
+        else:
+            self.place()
+
+    def place(self):
+        """панель полупрозрачная, если выделение заходит под неё"""
+        r = self.sel.shade.rect
+        under = False
+        if r and self.mode != "display":
+            ok, b = self.box.compute_bounds(self.sel.shade)
+            if ok:
+                bx, by, bw, bh = b.get_x(), b.get_y(), b.get_width(), b.get_height()
+                under = r[0] < bx + bw and bx < r[0] + r[2] and r[1] < by + bh and by < r[1] + r[3]
+        self.box.set_opacity(0.35 if under else 1)
+
+    def set_mode(self, m):
+        self.mode = m
+        self.sel.set_mode(m)
+        self.place()
+        self.sync()
+
+    def set_video(self, v):
+        self.video = v
+        if v:  # видео пишется живым, без замороженного кадра
+            self.unfreeze()
+        elif self.active and not self.freeze:
+            self.freeze = popen(["hyprpicker", "-r", "-z"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.restack()
+        self.sync()
+
+    def set_pointer(self, p):
+        self.pointer = p
+        self.sync()
+
+    # ---------- открыть / закрыть
+    def toggle(self):
+        pid = recording_pid()
+        if pid:  # во время записи сочетание её останавливает
+            os.kill(pid, signal.SIGINT)
+            return True
+        if self.active:
+            self.close_all()
+            return True
+        self.active = True
+        if not self.video:
+            self.freeze = popen(["hyprpicker", "-r", "-z"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.mon = next((m for m in (hypr("monitors") or []) if m.get("focused")), None)
+        if self.mon:
+            gm = next((m for m in iter_monitors() if m.get_connector() == self.mon["name"]), None)
+            if gm:
+                LS.set_monitor(self, gm)
+        self.sel.reset(self.mon, self.mode)
+        self.dragging(False)
+        self.restack()
+        return True
+
+    def restack(self):
+        """порядок слоёв: замороженный кадр, потом панель. Позже показанный слой выше,
+        поэтому ждём, пока hyprpicker реально появится на всех мониторах: иначе он ляжет
+        сверху, заберёт клик (выберет цвет и выйдет) и Esc."""
+        self.set_visible(False)
+        freeze = self.freeze
+        n_mons = len(hypr("monitors") or [1])
+
+        def wait():
+            for _ in range(60):  # до 3 с
+                if not freeze or freeze.poll() is not None:
+                    break
+                layers = subprocess.run(["hyprctl", "layers"], capture_output=True, text=True,
+                                        env=CLEAN_ENV).stdout
+                if layers.count("namespace: hyprpicker") >= n_mons:
+                    time.sleep(0.05)  # дать ему отрисовать кадр
+                    break
+                time.sleep(0.05)
+            GLib.idle_add(show)
+
+        def show():
+            if self.active:
+                self.present()
+            return False
+        threading.Thread(target=wait, daemon=True).start()
+
+    def unfreeze(self):
+        if self.freeze and self.freeze.poll() is None:
+            self.freeze.kill()  # на TERM hyprpicker иногда не реагирует
+            threading.Thread(target=self.freeze.wait, daemon=True).start()
+        self.freeze = None
+
+    def close_all(self):
+        self.active = False
+        self.unfreeze()
+        self.set_visible(False)
+
+    # ---------- съёмка: только по Пробелу, Enter или большой кнопке
+    def capture(self):
+        if self.mode == "display":
+            self.shoot_now(output=self.mon["name"] if self.mon else None)
+            return
+        geom = self.sel.geometry()
+        if geom:
+            self.shoot_now(geom=geom)
+        else:
+            self.hint.set_text("Сначала выделите область" if self.mode == "area" else "Сначала нажмите на окно")
+
+    def shoot_now(self, geom=None, output=None):
+        self.set_visible(False)
+        self.active = False
+        target = ["-g", geom] if geom else (["-o", output] if output else [])
+        if self.video:
+            self.unfreeze()
+            GLib.timeout_add(150, lambda: (self.record(target), False)[1])
+        else:
+            GLib.timeout_add(120, lambda: (self.photo(target), False)[1])
+
+    def photo(self, target):
+        os.makedirs(SHOTS, exist_ok=True)
+        f = os.path.join(SHOTS, f"Снимок экрана от {stamp()}.png")
+        cmd = ["grim", "-l", "1"] + (["-c"] if self.pointer else []) + target + [f]
+
+        def work():
+            ok = subprocess.run(cmd, env=CLEAN_ENV).returncode == 0
+            GLib.idle_add(lambda: (self.unfreeze(), False)[1])
+            if ok:
+                with open(f, "rb") as fh:
+                    subprocess.run(["wl-copy", "--type", "image/png"], stdin=fh, env=CLEAN_ENV)
+                notify("Снимок экрана сделан", "Можно вставить из буфера обмена", f)
+        threading.Thread(target=work, daemon=True).start()
+
+    def record(self, target):
+        os.makedirs(CASTS, exist_ok=True)
+        f = os.path.join(CASTS, f"Запись экрана от {stamp()}.webm")
+        cmd = (["wf-recorder", "-y", "-c", "libvpx", "-p", "deadline=realtime", "-p", "cpu-used=8"]
+               + (["-g", target[1]] if target[:1] == ["-g"] else target) + ["-f", f])
+        p = popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        open(REC_PID, "w").write(str(p.pid))
+
+        def wait():
+            p.wait()
+            try:
+                if open(REC_PID).read().strip() == str(p.pid):
+                    os.remove(REC_PID)
+            except (FileNotFoundError, ValueError):
+                pass
+            notify("Запись экрана сохранена", f)
+        threading.Thread(target=wait, daemon=True).start()
+
+    def on_key(self, ctrl, kv, kc, state):
+        if kv == Gdk.KEY_Escape:
+            self.close_all()
+        elif kv in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
+            self.capture()
+        # буквы по физической клавише, чтобы работали и в русской раскладке (код evdev + 8)
+        elif kc == 39:  # S
+            self.set_mode("area")
+        elif kc == 54:  # C
+            self.set_mode("display")
+        elif kc == 25:  # W
+            self.set_mode("window")
+        elif kc == 55:  # V
+            self.set_video(not self.video)
+        elif kc == 33:  # P
+            self.set_pointer(not self.pointer)
+        else:
+            return False
+        return True
+
+
+def iter_monitors():
+    mons = Gdk.Display.get_default().get_monitors()
+    return [mons.get_item(i) for i in range(mons.get_n_items())]
+
+
+def main():
+    try:
+        os.kill(int(open(PID).read()), 0)
+        print("mono-screenshot уже запущен")
+        return
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        pass
+    open(PID, "w").write(str(os.getpid()))
+    show_now = sys.argv[1:2] == ["toggle"]
+
+    css = Gtk.CssProvider()
+    css.load_from_data(CSS)
+    app = Gtk.Application(application_id="dev.mono.screenshot", flags=Gio.ApplicationFlags.NON_UNIQUE)
+
+    def activate(a):
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        win = Panel(a)
+        a.hold()
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, win.toggle)
+        if show_now:
+            win.toggle()
+
+    app.connect("activate", activate)
+    try:
+        app.run([])
+    finally:
+        try:
+            if open(PID).read().strip() == str(os.getpid()):
+                os.remove(PID)
+        except (FileNotFoundError, ValueError):
+            pass
+
+
+if __name__ == "__main__":
+    main()

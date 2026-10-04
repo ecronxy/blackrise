@@ -1,0 +1,85 @@
+{
+  "$schema": "/etc/xdg/swaync/configSchema.json",
+  "positionX": "left",
+  "positionY": "top",
+  "layer": "overlay",
+  "control-center-layer": "overlay",
+  "layer-shell": true,
+  "cssPriority": "user",
+  "control-center-margin-top": 14,
+  "control-center-margin-bottom": 14,
+  "control-center-margin-left": 14,
+  "control-center-width": 420,
+  "notification-window-width": 400,
+  "notification-icon-size": 44,
+  "notification-body-image-height": 140,
+  "notification-body-image-width": 220,
+  "timeout": 6,
+  "timeout-low": 4,
+  "timeout-critical": 0,
+  "fit-to-screen": true,
+  "keyboard-shortcuts": true,
+  "image-visibility": "when-available",
+  "transition-time": 180,
+  "hide-on-clear": false,
+  "hide-on-action": true,
+  "script-fail-notify": false,
+  "widgets": [
+    "title",
+    "dnd",
+    "buttons-grid",
+    "volume",
+    "mpris",
+    "notifications"
+  ],
+  "widget-config": {
+    "title": {
+      "text": "Центр управления",
+      "clear-all-button": true,
+      "button-text": "Очистить"
+    },
+    "dnd": {
+      "text": "Не беспокоить"
+    },
+    "buttons-grid": {
+      "actions": [
+        {
+          "label": "Wi-Fi",
+          "type": "toggle",
+          "command": "sh -c '[ \"$SWAYNC_TOGGLE_STATE\" = true ] && nmcli radio wifi on || nmcli radio wifi off'",
+          "update-command": "sh -c 'nmcli radio wifi | grep -q enabled && printf true || printf false'"
+        },
+        {
+          "label": "Bluetooth",
+          "type": "toggle",
+          "command": "sh -c '[ \"$SWAYNC_TOGGLE_STATE\" = true ] && bluetoothctl power on || bluetoothctl power off'",
+          "update-command": "sh -c 'timeout 2 bluetoothctl show 2>/dev/null | grep -q \"Powered: yes\" && printf true || printf false'"
+        },
+        {
+          "label": "VPN",
+          "command": "sh -c 'swaync-client -cp; ~/.local/bin/mono-settings network'"
+        },
+        {
+          "label": "Снимок",
+          "command": "sh -c 'swaync-client -cp; sleep 0.3; ~/.local/bin/mono-screenshot toggle'"
+        },
+        {
+          "label": "Настройки",
+          "command": "sh -c 'swaync-client -cp; ~/.local/bin/mono-settings'"
+        },
+        {
+          "label": "Выкл.",
+          "command": "sh -c 'swaync-client -cp; wlogout -b 5 -T 400 -B 400'"
+        }
+      ]
+    },
+    "volume": {
+      "label": "звук",
+      "show-per-app": false
+    },
+    "mpris": {
+      "image-size": 64,
+      "image-radius": 14
+    }
+  }
+}

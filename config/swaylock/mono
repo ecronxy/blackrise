@@ -1,0 +1,25 @@
+color=000000
+indicator-radius=90
+indicator-thickness=6
+inside-color=00000000
+inside-clear-color=00000000
+inside-ver-color=00000000
+inside-wrong-color=00000000
+ring-color=ffffffff
+ring-clear-color=ffffffff
+ring-ver-color=ffffffff
+ring-wrong-color=ffffffff
+key-hl-color=ffffffff
+bs-hl-color=ffffffff
+line-color=00000000
+line-clear-color=00000000
+line-ver-color=00000000
+line-wrong-color=00000000
+separator-color=00000000
+text-color=ffffffff
+text-clear-color=ffffffff
+text-ver-color=ffffffff
+text-wrong-color=ffffffff
+font=Hack Nerd Font Mono
+show-failed-attempts
+ignore-empty-password

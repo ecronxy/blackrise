@@ -1,0 +1,5 @@
+#!/bin/sh
+# новое окно Ghostty сразу: просим у фонового экземпляра через D-Bus, без запуска программы
+gdbus call --session --dest com.mitchellh.ghostty --object-path /com/mitchellh/ghostty \
+  --method org.gtk.Actions.Activate new-window '[]' '{}' >/dev/null 2>&1 \
+  || exec ghostty --gtk-single-instance=true

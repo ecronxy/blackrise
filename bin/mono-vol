@@ -1,0 +1,8 @@
+#!/bin/sh
+# громкость с индикатором: mono-vol up | down | mute
+case "$1" in
+  up)   wpctl set-mute @DEFAULT_AUDIO_SINK@ 0; wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+ ;;
+  down) wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%- ;;
+  mute) wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle ;;
+esac
+kill -HUP "$(cat "${XDG_RUNTIME_DIR:-/tmp}/mono-dock.pid" 2>/dev/null)" 2>/dev/null

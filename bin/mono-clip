@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+# mono-clip: история буфера обмена (текст и картинки), как Clipboard Indicator в GNOME.
+#   mono-clip watch   фоновый сборщик (запускается при входе в Hyprland)
+#   mono-clip pick    список истории в wofi: выбрал запись, она снова в буфере
+#   mono-clip clear   очистить историю
+import hashlib
+import os
+import subprocess
+import sys
+import time
+
+DIR = os.path.expanduser("~/.cache/mono-clip")
+LIMIT = 60
+WOFI = ["wofi", "--dmenu", "--cache-file", "/dev/null", "--prompt", "буфер обмена",
+        "-c", os.path.expanduser("~/.config/wofi/mono/config"),
+        "-s", os.path.expanduser("~/.config/wofi/mono/style.css")]
+CLEAR = "×  очистить историю"
+
+
+def entries():
+    try:
+        files = [f for f in os.listdir(DIR) if f.endswith((".txt", ".png"))]
+    except FileNotFoundError:
+        return []
+    return sorted(files, key=lambda f: os.path.getmtime(os.path.join(DIR, f)), reverse=True)
+
+
+def store():
+    # вызывается wl-paste --watch при каждом новом копировании
+    sys.stdin.buffer.read()  # данные читаем ниже с нужным типом
+    types = subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True).stdout.split()
+    if any("passwordManagerHint" in t or "x-kde-passwordManager" in t for t in types):
+        return  # менеджеры паролей просят не сохранять
+    if any(t.startswith("text/plain") or t in ("UTF8_STRING", "TEXT", "STRING") for t in types):
+        data, ext = subprocess.run(["wl-paste", "--no-newline"], capture_output=True).stdout, "txt"
+        if not data.strip():
+            return
+    elif "image/png" in types:
+        data, ext = subprocess.run(["wl-paste", "--type", "image/png"], capture_output=True).stdout, "png"
+    else:
+        return
+    os.makedirs(DIR, exist_ok=True)
+    path = os.path.join(DIR, hashlib.sha1(data).hexdigest()[:16] + "." + ext)
+    if os.path.exists(path):
+        os.utime(path)  # уже есть: поднять наверх
+    else:
+        with open(path, "wb") as f:
+            f.write(data)
+    for old in entries()[LIMIT:]:
+        os.remove(os.path.join(DIR, old))
+
+
+def preview(name):
+    path = os.path.join(DIR, name)
+    if name.endswith(".png"):
+        size = ""
+        try:
+            with open(path, "rb") as f:
+                head = f.read(24)
+            w, h = int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+            size = f" {w}×{h}"
+        except OSError:
+            pass
+        return f"[картинка{size}]  " + time.strftime("%H:%M %d.%m", time.localtime(os.path.getmtime(path)))
+    text = open(path, encoding="utf-8", errors="replace").read()
+    one = " ⏎ ".join(line.strip() for line in text.strip().splitlines() if line.strip())
+    return one[:90] + ("…" if len(one) > 90 else "")
+
+
+def pick():
+    items = entries()
+    lines = [f"{i + 1:>2}  {preview(n)}" for i, n in enumerate(items)]
+    lines.append(CLEAR if items else "история пуста")
+    r = subprocess.run(WOFI, input="\n".join(lines), capture_output=True, text=True)
+    choice = r.stdout.strip()
+    if not choice:
+        return
+    if choice == CLEAR:
+        clear()
+        return
+    try:
+        name = items[int(choice.split()[0]) - 1]
+    except (ValueError, IndexError):
+        return
+    path = os.path.join(DIR, name)
+    cmd = ["wl-copy"] + (["--type", "image/png"] if name.endswith(".png") else [])
+    with open(path, "rb") as f:
+        subprocess.run(cmd, stdin=f)
+    os.utime(path)
+
+
+def clear():
+    for n in entries():
+        os.remove(os.path.join(DIR, n))
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "pick"
+    if cmd == "watch":
+        os.execvp("wl-paste", ["wl-paste", "--watch", sys.executable, os.path.abspath(__file__), "store"])
+    {"store": store, "pick": pick, "clear": clear}.get(cmd, pick)()

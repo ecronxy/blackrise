@@ -1,0 +1,15 @@
+#!/bin/sh
+# Экран блокировки blackrise (mono-lock.py). Возвращается, когда экран уже заблокирован,
+# как swaylock -f: swayidle перед сном ждёт именно этого.
+ready="${XDG_RUNTIME_DIR:-/tmp}/mono-lock.ready"
+pidf="${XDG_RUNTIME_DIR:-/tmp}/mono-lock.pid"
+if [ -f "$pidf" ] && kill -0 "$(cat "$pidf")" 2>/dev/null; then exit 0; fi
+rm -f "$ready"
+setsid "$HOME/.local/bin/mono-lock.py" </dev/null >/dev/null 2>&1 &
+i=0
+while [ $i -lt 50 ]; do
+  [ -e "$ready" ] && exit 0
+  i=$((i + 1)); sleep 0.1
+done
+# не дождались: запасной вариант, чтобы экран точно не остался открытым
+pidof -q mono-lock.py || exec swaylock -f -C "$HOME/.config/swaylock/mono"
