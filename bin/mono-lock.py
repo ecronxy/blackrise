@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # mono-lock: экран блокировки blackrise в чёрно-белом ASCII-стиле.
 # Настоящая блокировка Wayland (ext-session-lock): пока экран не разблокирован паролем,
-# Hyprland не показывает ни одного окна. Пароль проверяет PAM (сервис swaylock, как у swaylock).
+# Hyprland не показывает ни одного окна. Пароль проверяет PAM (сервис login).
 #   запускать через mono-lock: обёртка ждёт, пока экран реально заблокируется (как swaylock -f)
 #   MONO_LOCK_TEST=5     проверка: сам разблокируется через 5 секунд
 import os
@@ -73,7 +73,6 @@ window { background: #000000; }
 .pw text selection { background: #ffffff; color: #000000; }
 .status { font-size: 13px; min-height: 20px; margin-top: 12px; }
 .status.err { font-weight: bold; }
-.hint { font-size: 12px; color: rgba(255,255,255,0.5); margin-top: 6px; }
 """
 
 
@@ -163,14 +162,8 @@ class Screen(Gtk.Window):
             self.status = Gtk.Label(label="")
             self.status.add_css_class("status")
             col.append(self.status)
-            self.hint = Gtk.Label(label="")
-            self.hint.add_css_class("hint")
-            col.append(self.hint)
         self.set_child(col)
 
-    def set_hint(self, layout):
-        if self.main:
-            self.hint.set_text(f"раскладка {layout} · enter")
 
     def tick_clock(self):
         self.clock.set_text(big_clock())
@@ -247,18 +240,11 @@ class LockApp(Gtk.Application):
         # пароль латиницей: включаем первую раскладку (us), после разблокировки вернём прежнюю
         self.prev_layout = layout_index()
         hypr_cmd("switchxkblayout all 0")
-        self.tick_layout()
 
     def tick_clock(self):
         for s in self.screens:
             s.tick_clock()
-        self.tick_layout()
         return True
-
-    def tick_layout(self):
-        lay = layout_name()
-        for s in self.screens:
-            s.set_hint(lay)
 
     def on_unlocked(self):
         if self.prev_layout:
@@ -284,7 +270,9 @@ class LockApp(Gtk.Application):
         def work():
             ok = False
             try:
-                ok = pam.pam().authenticate(USER, password, service="swaylock")
+                # сервис login: у swaylock в PAM нет секции account, и python-pam
+                # отклоняет даже верный пароль на проверке учётной записи
+                ok = pam.pam().authenticate(USER, password, service="login")
             except Exception:
                 ok = False
             GLib.idle_add(done, ok)
