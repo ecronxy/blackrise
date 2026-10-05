@@ -1401,6 +1401,10 @@ class Dock(Gtk.ApplicationWindow):
         self.mon = monitor_by_name(MAIN_OUTPUT)
         if self.mon:
             LS.set_monitor(self, self.mon)
+        # основной монитор мог появиться позже дока (старт сессии, переподключение):
+        # тогда док переезжает на него сам
+        Gdk.Display.get_default().get_monitors().connect(
+            "items-changed", lambda *_: GLib.timeout_add(500, self.ensure_main_monitor))
 
         self.apps = Apps()
         self.pins = load_pins()
@@ -1507,6 +1511,15 @@ class Dock(Gtk.ApplicationWindow):
         if kb:
             self.lang.set_label("RU" if "Russian" in kb.get("active_keymap", "") else "EN")
         return True
+
+    def ensure_main_monitor(self):
+        mon = monitor_by_name(MAIN_OUTPUT)
+        if mon and mon is not self.mon:
+            self.mon = mon
+            self.set_visible(False)  # layer-shell меняет монитор только при повторном показе
+            LS.set_monitor(self, mon)
+            self.present()
+        return False
 
     def rec_tick(self):
         self.rec.set_visible(recording_pid() is not None)
